@@ -65,6 +65,22 @@ func LoadCompressedJSON[T any](path string) (T, error) {
 	return value, nil
 }
 
+func LoadJSON[T any](path string) (T, error) {
+	var value T
+
+	file, err := os.Open(path)
+	if err != nil {
+		return value, fmt.Errorf("open JSON %q: %w", path, err)
+	}
+	defer file.Close()
+
+	if err := json.NewDecoder(file).Decode(&value); err != nil {
+		return value, fmt.Errorf("decode JSON %q: %w", path, err)
+	}
+
+	return value, nil
+}
+
 func LoadCountryAliases(countryAliasesPath string, provinceAliasesPath string) (alpha2 map[string]string, possibilities map[string][]string, err error) {
 	countryAliases, err := LoadCompressedJSON[map[string][]string](countryAliasesPath)
 	if err != nil {

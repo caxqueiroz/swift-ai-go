@@ -34,6 +34,26 @@ func TestLoadCompressedJSONDecodesZlibJSON(t *testing.T) {
 	}
 }
 
+func TestLoadJSONDecodesPlainJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "country-groupings.json")
+	if err := os.WriteFile(path, []byte(`{"EU":["FR","DE"],"NA":["US"]}`), 0o600); err != nil {
+		t.Fatalf("write JSON fixture: %v", err)
+	}
+
+	got, err := LoadJSON[map[string][]string](path)
+	if err != nil {
+		t.Fatalf("LoadJSON() error = %v", err)
+	}
+
+	want := map[string][]string{
+		"EU": {"FR", "DE"},
+		"NA": {"US"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("LoadJSON() = %#v, want %#v", got, want)
+	}
+}
+
 func TestLoadCompressedJSONReturnsContextForDecodeErrors(t *testing.T) {
 	t.Run("invalid zlib", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "invalid-zlib.json.zlib")
