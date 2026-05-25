@@ -49,6 +49,25 @@ func TestReadDelimitedReadsSuggestionColumns(t *testing.T) {
 	}
 }
 
+func TestReadDelimitedNormalizesPaddedAndBOMPrefixedHeaders(t *testing.T) {
+	path := writeTempFile(t, "addresses.csv", strings.Join([]string{
+		"\ufeff address , suggested_country , force_suggested_country ",
+		"10 Downing St, gb , y ",
+	}, "\n"))
+
+	got, err := ReadDelimited(path, ',', DefaultAddressColumn)
+	if err != nil {
+		t.Fatalf("ReadDelimited() error = %v", err)
+	}
+
+	want := []core.AddressSample{
+		{Text: "10 Downing St", SuggestedCountry: "GB", HasSuggestedCountry: true, ForceSuggestedCountry: true},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadDelimited() = %#v, want %#v", got, want)
+	}
+}
+
 func TestReadDelimitedMissingSuggestionColumnsDefaultToNoSuggestion(t *testing.T) {
 	path := writeTempFile(t, "addresses.csv", strings.Join([]string{
 		"address",

@@ -1,8 +1,10 @@
 package readers
 
 import (
+	"bufio"
 	"encoding/csv"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -16,20 +18,30 @@ const (
 )
 
 func ReadText(path string) ([]core.AddressSample, error) {
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open text file %q: %w", path, err)
 	}
+	defer file.Close()
 
-	text := strings.ReplaceAll(string(data), "\r\n", "\n")
-	lines := strings.Split(text, "\n")
-	if len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
-	}
-
-	samples := make([]core.AddressSample, 0, len(lines))
-	for _, line := range lines {
-		samples = append(samples, core.AddressSample{Text: line})
+	reader := bufio.NewReader(file)
+	var samples []core.AddressSample
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return nil, fmt.Errorf("read text file %q: %w", path, err)
+		}
+		if len(line) > 0 {
+			hadNewline := strings.HasSuffix(line, "\n")
+			line = strings.TrimSuffix(line, "\n")
+			if hadNewline {
+				line = strings.TrimSuffix(line, "\r")
+			}
+			samples = append(samples, core.AddressSample{Text: line})
+		}
+		if err == io.EOF {
+			break
+		}
 	}
 	return samples, nil
 }
@@ -37,7 +49,7 @@ func ReadText(path string) ([]core.AddressSample, error) {
 func ReadDelimited(path string, comma rune, addressColumn string) ([]core.AddressSample, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open delimited file %q: %w", path, err)
 	}
 	defer file.Close()
 
@@ -45,24 +57,30 @@ func ReadDelimited(path string, comma rune, addressColumn string) ([]core.Addres
 	reader.Comma = comma
 	reader.FieldsPerRecord = -1
 
-	records, err := reader.ReadAll()
-	if err != nil {
-		return nil, err
+	header, err := reader.Read()
+	if err == io.EOF {
+		return nil, columnNotFoundError(path, addressColumn)
 	}
-	if len(records) == 0 {
-		return nil, fmt.Errorf("Column '%s' not found", addressColumn)
+	if err != nil {
+		return nil, fmt.Errorf("read header from delimited file %q: %w", path, err)
 	}
 
-	header := records[0]
 	addressIndex := columnIndex(header, addressColumn)
 	if addressIndex < 0 {
-		return nil, fmt.Errorf("Column '%s' not found", addressColumn)
+		return nil, columnNotFoundError(path, addressColumn)
 	}
 	suggestedCountryIndex := columnIndex(header, DefaultSuggestedCountryColumn)
 	forceSuggestedCountryIndex := columnIndex(header, DefaultForceSuggestedCountryColumn)
 
-	samples := make([]core.AddressSample, 0, len(records)-1)
-	for _, record := range records[1:] {
+	var samples []core.AddressSample
+	for {
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read record from delimited file %q: %w", path, err)
+		}
 		if addressIndex >= len(record) || record[addressIndex] == "" {
 			continue
 		}
@@ -84,9 +102,16 @@ func ReadDelimited(path string, comma rune, addressColumn string) ([]core.Addres
 	return samples, nil
 }
 
+func columnNotFoundError(path, column string) error {
+	return fmt.Errorf("read delimited file %q: Column '%s' not found", path, column)
+}
+
 func columnIndex(header []string, column string) int {
 	for i, name := range header {
-		if name == column {
+		if i == 0 {
+			name = strings.TrimPrefix(name, "\ufeff")
+		}
+		if strings.TrimSpace(name) == column {
 			return i
 		}
 	}
