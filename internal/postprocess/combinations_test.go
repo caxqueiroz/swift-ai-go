@@ -121,6 +121,27 @@ func TestCombinationForcedSuggestedCountryFiltersMismatchedCountries(t *testing.
 	}
 }
 
+func TestCombinationForcedSuggestedNoCountryFiltersCountriesButKeepsSoloTowns(t *testing.T) {
+	generator := newDefaultCombinationGenerator(nil)
+	generator.SetSuggestedCountry("NO COUNTRY", true)
+	generator.SetForceSuggestedCountry(true)
+	noCountry := createFuzzyMatch("NO COUNTRY", "NO COUNTRY", "NO COUNTRY", 0, 0, 0.15, nil)
+	noTown := createFuzzyMatch("NO TOWN", "NO TOWN", "NO TOWN", 0, 0, 0.15, nil)
+	country := createFuzzyMatch("France", "France", "FR", 7, 13, 0.95, nil)
+	town := createFuzzyMatch("Paris", "Paris", "FR", 0, 5, 0.90, nil)
+
+	got := generator.Generate([]core.FuzzyMatch{country}, []core.FuzzyMatch{town}, noCountry, noTown)
+
+	if !hasPair(got, "NO COUNTRY", "Paris") {
+		t.Fatalf("Generate did not keep solo town under forced NO COUNTRY: %#v", got)
+	}
+	for _, combo := range got {
+		if combo.Country.Origin == "FR" {
+			t.Fatalf("Generate included real country under forced NO COUNTRY: %#v in %#v", combo, got)
+		}
+	}
+}
+
 func TestCombinationSamePositionCountryTownPairsAreSkippedUnlessSameName(t *testing.T) {
 	noCountry := createFuzzyMatch("NO COUNTRY", "NO COUNTRY", "NO COUNTRY", 0, 0, 0.15, nil)
 	noTown := createFuzzyMatch("NO TOWN", "NO TOWN", "NO TOWN", 0, 0, 0.15, nil)
@@ -145,6 +166,20 @@ func TestCombinationSamePositionCountryTownPairsAreSkippedUnlessSameName(t *test
 	)
 	if !hasPair(withException, "SG", "Singapore") {
 		t.Fatalf("Generate did not include same-position pair with exception: %#v", withException)
+	}
+}
+
+func TestCombinationCrossingOverlapPairIsGenerated(t *testing.T) {
+	generator := newDefaultCombinationGenerator(nil)
+	noCountry := createFuzzyMatch("NO COUNTRY", "NO COUNTRY", "NO COUNTRY", 0, 0, 0.15, nil)
+	noTown := createFuzzyMatch("NO TOWN", "NO TOWN", "NO TOWN", 0, 0, 0.15, nil)
+	country := createFuzzyMatch("France", "France", "FR", 3, 8, 0.90, nil)
+	town := createFuzzyMatch("Paris", "Paris", "FR", 0, 5, 0.88, nil)
+
+	got := generator.Generate([]core.FuzzyMatch{country}, []core.FuzzyMatch{town}, noCountry, noTown)
+
+	if !hasPair(got, "FR", "Paris") {
+		t.Fatalf("Generate skipped crossing overlap pair: %#v", got)
 	}
 }
 

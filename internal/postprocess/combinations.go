@@ -77,7 +77,7 @@ func (g CombinationGenerator) Generate(countries, towns []core.FuzzyMatch, noCou
 		})
 	}
 
-	if !g.forcedRealSuggestedCountry() {
+	if !g.forcedNonNoCountry() {
 		for _, town := range towns {
 			combinations = append(combinations, Combination{
 				Country: noCountry,
@@ -103,14 +103,18 @@ func (g CombinationGenerator) Generate(countries, towns []core.FuzzyMatch, noCou
 }
 
 func (g CombinationGenerator) countryAllowed(country core.FuzzyMatch) bool {
-	if !g.forcedRealSuggestedCountry() {
+	if !g.forcedSuggestedCountry() {
 		return true
 	}
 	return country.Origin == g.SuggestedCountry
 }
 
-func (g CombinationGenerator) forcedRealSuggestedCountry() bool {
-	return g.ForceSuggestedCountry && g.HasSuggestedCountry && g.SuggestedCountry != "" && g.SuggestedCountry != "NO COUNTRY"
+func (g CombinationGenerator) forcedSuggestedCountry() bool {
+	return g.ForceSuggestedCountry && g.HasSuggestedCountry && g.SuggestedCountry != ""
+}
+
+func (g CombinationGenerator) forcedNonNoCountry() bool {
+	return g.forcedSuggestedCountry() && g.SuggestedCountry != "NO COUNTRY"
 }
 
 func (g CombinationGenerator) shouldSkipPair(country, town core.FuzzyMatch) bool {
@@ -118,7 +122,13 @@ func (g CombinationGenerator) shouldSkipPair(country, town core.FuzzyMatch) bool
 		return g.CountryTownSameName[town.Possibility] != country.Origin
 	}
 
-	return spansOverlap(country.Start, country.End, town.Start, town.End)
+	return containsSpan(country.Start, country.End, town.Start, town.End) ||
+		containsSpan(town.Start, town.End, country.Start, country.End)
+}
+
+func containsSpan(outerStart, outerEnd, innerStart, innerEnd int) bool {
+	return (innerStart > outerStart && innerEnd <= outerEnd) ||
+		(innerStart >= outerStart && innerEnd < outerEnd)
 }
 
 func (g CombinationGenerator) soloCountryScore(country core.FuzzyMatch) float64 {
@@ -154,10 +164,6 @@ func (g CombinationGenerator) soloTownScore(town core.FuzzyMatch) float64 {
 	}
 
 	return (g.Config.MinimalFinalScoreCountry + town.FinalScore - g.Config.NoCountryFoundMul*cumulativeMalus) / 2
-}
-
-func spansOverlap(leftStart, leftEnd, rightStart, rightEnd int) bool {
-	return leftStart < rightEnd && rightStart < leftEnd
 }
 
 func dedupeCombinations(combinations []Combination) []Combination {
