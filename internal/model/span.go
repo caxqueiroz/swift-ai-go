@@ -7,6 +7,7 @@ func CreateDetailsFromBIOTags(raw string, country string, confidence float64, ta
 		Content:               raw,
 		CountryCode:           country,
 		CountryCodeConfidence: confidence,
+		Spans:                 []core.TaggedSpan{},
 	}
 	if len(tags) == 0 {
 		return details
