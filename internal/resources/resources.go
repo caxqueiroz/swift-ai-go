@@ -21,13 +21,15 @@ type Database struct {
 	CountryTownSameName  map[string]string
 	CountryGroupings     map[string][]string
 	CountrySpecs         map[string]CountrySpec
+	Provinces            map[string][]string
 	Postcodes            map[string]map[string][]PostcodeEntry
 }
 
 type CountrySpec struct {
-	Domains       []string
-	PhonePrefixes []string
-	IBAN          bool
+	Domains         []string `json:"domain_extensions"`
+	PhonePrefixes   []string `json:"phone_prefixes"`
+	PostalCodeRegex string   `json:"postal_code_regex"`
+	IBAN            bool     `json:"iban"`
 }
 
 type PostcodeEntry struct {
