@@ -1,0 +1,236 @@
+package postprocess
+
+import (
+	"math"
+	"testing"
+
+	"github.com/tipmarket/swift-ai/internal/config"
+	"github.com/tipmarket/swift-ai/internal/core"
+)
+
+func TestScoreHighCRFScoreProducesScoreAboveHalf(t *testing.T) {
+	scorer := newDefaultScoreComputer()
+
+	if got := scorer.ComputeTownScore(0.8, 0, nil); got <= 0.5 {
+		t.Fatalf("ComputeTownScore(0.8, 0, nil) = %f, want > 0.5", got)
+	}
+	if got := scorer.ComputeCountryScore(0.8, 0, nil); got <= 0.5 {
+		t.Fatalf("ComputeCountryScore(0.8, 0, nil) = %f, want > 0.5", got)
+	}
+}
+
+func TestScoreLowCRFScoreProducesScoreBelowHalf(t *testing.T) {
+	scorer := newDefaultScoreComputer()
+
+	if got := scorer.ComputeTownScore(0.2, 0, nil); got >= 0.5 {
+		t.Fatalf("ComputeTownScore(0.2, 0, nil) = %f, want < 0.5", got)
+	}
+	if got := scorer.ComputeCountryScore(0.2, 0, nil); got >= 0.5 {
+		t.Fatalf("ComputeCountryScore(0.2, 0, nil) = %f, want < 0.5", got)
+	}
+}
+
+func TestScoreDistanceDecreasesScoreUnlessSeparatorTypoIsPresent(t *testing.T) {
+	scorer := newDefaultScoreComputer()
+
+	townBase := scorer.ComputeTownScore(0.7, 0, nil)
+	townWithDistance := scorer.ComputeTownScore(0.7, 1, nil)
+	townWithSeparatorTypo := scorer.ComputeTownScore(0.7, 1, []core.Flag{core.FlagIsSeparatorTypo})
+	if townWithDistance >= townBase {
+		t.Fatalf("town score with distance = %f, want less than base %f", townWithDistance, townBase)
+	}
+	if townWithSeparatorTypo != townBase {
+		t.Fatalf("town score with separator typo distance = %f, want unchanged base %f", townWithSeparatorTypo, townBase)
+	}
+
+	countryBase := scorer.ComputeCountryScore(0.7, 0, nil)
+	countryWithDistance := scorer.ComputeCountryScore(0.7, 1, nil)
+	countryWithSeparatorTypo := scorer.ComputeCountryScore(0.7, 1, []core.Flag{core.FlagIsSeparatorTypo})
+	if countryWithDistance >= countryBase {
+		t.Fatalf("country score with distance = %f, want less than base %f", countryWithDistance, countryBase)
+	}
+	if countryWithSeparatorTypo != countryBase {
+		t.Fatalf("country score with separator typo distance = %f, want unchanged base %f", countryWithSeparatorTypo, countryBase)
+	}
+}
+
+func TestScoreTownBonusFlagsIncreaseScore(t *testing.T) {
+	scorer := newDefaultScoreComputer()
+	base := scorer.ComputeTownScore(0.4, 0, nil)
+	flags := []core.Flag{
+		core.FlagCountryIsPresent,
+		core.FlagIsVeryCloseToCountry,
+		core.FlagIsMetropolis,
+		core.FlagPostcodeForTownFound,
+		core.FlagMLPCountryIsPresent,
+		core.FlagIsAloneOnLine,
+	}
+
+	if got := scorer.ComputeTownScore(0.4, 0, flags); got <= base {
+		t.Fatalf("town score with bonus flags = %f, want greater than base %f", got, base)
+	}
+}
+
+func TestScoreTownMalusFlagsDecreaseScore(t *testing.T) {
+	scorer := newDefaultScoreComputer()
+	base := scorer.ComputeTownScore(0.8, 0, nil)
+	flags := []core.Flag{
+		core.FlagIsSmallTown,
+		core.FlagIsFromExtendedData,
+		core.FlagIsInsideAnotherWord,
+		core.FlagIsShort,
+	}
+
+	if got := scorer.ComputeTownScore(0.8, 0, flags); got >= base {
+		t.Fatalf("town score with malus flags = %f, want less than base %f", got, base)
+	}
+}
+
+func TestScoreTownCountryIsPresentMalusAppliesWhenCountryMissing(t *testing.T) {
+	townWeights := config.TownWeights{
+		CountryIsPresentMalus: 0.5,
+	}
+	scorer := NewScoreComputer(townWeights, config.CountryWeights{})
+
+	withoutCountry := scorer.ComputeTownScore(0.5, 0, nil)
+	withCountry := scorer.ComputeTownScore(0.5, 0, []core.Flag{core.FlagCountryIsPresent})
+	if withoutCountry <= withCountry {
+		t.Fatalf("town score without country = %f, want greater than score with country %f", withoutCountry, withCountry)
+	}
+}
+
+func TestScoreCountryBonusFlagsIncreaseScore(t *testing.T) {
+	scorer := newDefaultScoreComputer()
+	base := scorer.ComputeCountryScore(0.4, 0, nil)
+	flags := []core.Flag{
+		core.FlagTownIsPresent,
+		core.FlagIBANIsPresent,
+		core.FlagPhonePrefixIsPresent,
+		core.FlagDomainIsPresent,
+		core.FlagPostalCodeIsPresent,
+		core.FlagMLPStronglyAgrees,
+		core.FlagMLPAgrees,
+		core.FlagMLPDoesntDisagree,
+	}
+
+	if got := scorer.ComputeCountryScore(0.4, 0, flags); got <= base {
+		t.Fatalf("country score with bonus flags = %f, want greater than base %f", got, base)
+	}
+}
+
+func TestScoreCountryMalusFlagsDecreaseScore(t *testing.T) {
+	scorer := newDefaultScoreComputer()
+	base := scorer.ComputeCountryScore(0.8, 0, nil)
+	flags := []core.Flag{
+		core.FlagIsInsideAnotherWord,
+		core.FlagIsShort,
+		core.FlagIsCommonStateProvinceAlias,
+		core.FlagIsInsideStreet,
+	}
+
+	if got := scorer.ComputeCountryScore(0.8, 0, flags); got >= base {
+		t.Fatalf("country score with malus flags = %f, want less than base %f", got, base)
+	}
+}
+
+func TestScoreGeneratedBySuggestedCountryReturnsRawCRFScore(t *testing.T) {
+	scorer := newDefaultScoreComputer()
+
+	got := scorer.ComputeCountryScore(0.37, 2, []core.Flag{
+		core.FlagGeneratedBySuggestedCountry,
+		core.FlagIsInsideAnotherWord,
+		core.FlagTownIsPresent,
+	})
+	if got != 0.37 {
+		t.Fatalf("ComputeCountryScore generated by suggested country = %f, want raw CRF score 0.37", got)
+	}
+}
+
+func TestScoresStayInRange(t *testing.T) {
+	scorer := newDefaultScoreComputer()
+	cases := []struct {
+		name      string
+		crfScore  float64
+		distScore int
+		flags     []core.Flag
+	}{
+		{
+			name:      "very low CRF with town maluses",
+			crfScore:  -0.5,
+			distScore: 3,
+			flags: []core.Flag{
+				core.FlagIsShort,
+				core.FlagIsInsideAnotherWord,
+				core.FlagIsSmallTown,
+				core.FlagIsInsideAnotherHigherRankedMatch,
+			},
+		},
+		{
+			name:      "very high CRF with town bonuses",
+			crfScore:  1.5,
+			distScore: 0,
+			flags: []core.Flag{
+				core.FlagCountryIsPresent,
+				core.FlagSuggestedCountryIsPresent,
+				core.FlagPostcodeForTownFound,
+				core.FlagIsMetropolis,
+			},
+		},
+		{
+			name:      "very low CRF with country maluses",
+			crfScore:  -0.5,
+			distScore: 3,
+			flags: []core.Flag{
+				core.FlagIsShort,
+				core.FlagIsInsideAnotherWord,
+				core.FlagIsInsideStreet,
+				core.FlagIsCommonStateProvinceAlias,
+			},
+		},
+		{
+			name:      "very high CRF with country bonuses",
+			crfScore:  1.5,
+			distScore: 0,
+			flags: []core.Flag{
+				core.FlagTownIsPresent,
+				core.FlagIBANIsPresent,
+				core.FlagPhonePrefixIsPresent,
+				core.FlagDomainIsPresent,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name+"/town", func(t *testing.T) {
+			got := scorer.ComputeTownScore(tc.crfScore, tc.distScore, tc.flags)
+			assertScoreInRange(t, got)
+		})
+		t.Run(tc.name+"/country", func(t *testing.T) {
+			got := scorer.ComputeCountryScore(tc.crfScore, tc.distScore, tc.flags)
+			assertScoreInRange(t, got)
+		})
+	}
+}
+
+func newDefaultScoreComputer() ScoreComputer {
+	cfg := config.Default()
+	return NewScoreComputer(cfg.TownWeights, cfg.CountryWeights)
+}
+
+func assertScoreInRange(t *testing.T, got float64) {
+	t.Helper()
+
+	if !scoreInRange(got) {
+		t.Fatalf("score = %f, want in [0, 1]", got)
+	}
+}
+
+func scoreInRange(got float64) bool {
+	return !math.IsNaN(got) && got >= 0 && got <= 1
+}
+
+func TestScoreInRangeRejectsNaN(t *testing.T) {
+	if scoreInRange(math.NaN()) {
+		t.Fatal("scoreInRange(math.NaN()) = true, want false")
+	}
+}
