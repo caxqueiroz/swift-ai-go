@@ -4,3 +4,7 @@
 bin/
 *.test
 /iso-run
+
+# Python tooling artifacts
+__pycache__/
+*.pyc

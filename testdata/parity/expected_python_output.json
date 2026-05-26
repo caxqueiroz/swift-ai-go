@@ -1,0 +1,17 @@
+[
+  {
+    "address": "ACME GMBH\nHAUPTSTRASSE 1\n10115 BERLIN\nDE",
+    "country": "DE",
+    "town": "BERLIN"
+  },
+  {
+    "address": "77 RUE DE RIVOLI 75001 PARIS FR",
+    "country": "FR",
+    "town": "PARIS"
+  },
+  {
+    "address": "350 FIFTH AVENUE NEW YORK NY 10118 US",
+    "country": "US",
+    "town": "NEW YORK"
+  }
+]

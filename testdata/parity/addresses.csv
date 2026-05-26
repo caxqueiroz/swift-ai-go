@@ -1,0 +1,7 @@
+address,suggested_country,force_suggested_country
+"ACME GMBH
+HAUPTSTRASSE 1
+10115 BERLIN
+DE",DE,true
+77 RUE DE RIVOLI 75001 PARIS FR,FR,false
+350 FIFTH AVENUE NEW YORK NY 10118 US,US,false
