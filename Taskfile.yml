@@ -1,0 +1,46 @@
+version: "3"
+
+vars:
+  BIN_DIR: bin
+  BIN_NAME: iso-run
+  GO_CACHE: /private/tmp/swift-ai-go-build
+  GOLANGCI_LINT_CACHE: /private/tmp/swift-ai-golangci-lint
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  test:
+    desc: Run all Go tests
+    cmds:
+      - env GOCACHE={{.GO_CACHE}} go test ./...
+
+  build:
+    desc: Build the iso-run CLI
+    cmds:
+      - mkdir -p {{.BIN_DIR}}
+      - env GOCACHE={{.GO_CACHE}} go build -o {{.BIN_DIR}}/{{.BIN_NAME}} ./cmd/iso-run
+
+  lint:
+    desc: Run Go linters
+    cmds:
+      - env GOCACHE={{.GO_CACHE}} GOLANGCI_LINT_CACHE={{.GOLANGCI_LINT_CACHE}} golangci-lint run ./...
+
+  tidy:
+    desc: Tidy Go module dependencies
+    cmds:
+      - go mod tidy
+
+  verify:
+    desc: Run tests and linters
+    deps:
+      - test
+      - lint
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - rm -f {{.BIN_DIR}}/{{.BIN_NAME}}
