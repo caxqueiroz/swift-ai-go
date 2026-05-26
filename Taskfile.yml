@@ -3,6 +3,8 @@ version: "3"
 vars:
   BIN_DIR: bin
   BIN_NAME: iso-run
+  API_BIN_NAME: iso-api
+  CACHE_FILL_BIN_NAME: iso-cache-fill
   GO_CACHE: /private/tmp/swift-ai-go-build
   GOLANGCI_LINT_CACHE: /private/tmp/swift-ai-golangci-lint
 
@@ -19,10 +21,24 @@ tasks:
       - env GOCACHE={{.GO_CACHE}} go test ./...
 
   build:
-    desc: Build the iso-run CLI
+    desc: Build all binaries
     cmds:
       - mkdir -p {{.BIN_DIR}}
       - env GOCACHE={{.GO_CACHE}} go build -o {{.BIN_DIR}}/{{.BIN_NAME}} ./cmd/iso-run
+      - env GOCACHE={{.GO_CACHE}} go build -o {{.BIN_DIR}}/{{.API_BIN_NAME}} ./cmd/iso-api
+      - env GOCACHE={{.GO_CACHE}} go build -o {{.BIN_DIR}}/{{.CACHE_FILL_BIN_NAME}} ./cmd/iso-cache-fill
+
+  build-api:
+    desc: Build the iso-api server
+    cmds:
+      - mkdir -p {{.BIN_DIR}}
+      - env GOCACHE={{.GO_CACHE}} go build -o {{.BIN_DIR}}/{{.API_BIN_NAME}} ./cmd/iso-api
+
+  build-cache-fill:
+    desc: Build the iso-cache-fill command
+    cmds:
+      - mkdir -p {{.BIN_DIR}}
+      - env GOCACHE={{.GO_CACHE}} go build -o {{.BIN_DIR}}/{{.CACHE_FILL_BIN_NAME}} ./cmd/iso-cache-fill
 
   lint:
     desc: Run Go linters
@@ -44,3 +60,5 @@ tasks:
     desc: Remove build artifacts
     cmds:
       - rm -f {{.BIN_DIR}}/{{.BIN_NAME}}
+      - rm -f {{.BIN_DIR}}/{{.API_BIN_NAME}}
+      - rm -f {{.BIN_DIR}}/{{.CACHE_FILL_BIN_NAME}}
