@@ -23,7 +23,11 @@ func TestWriteHumanReadableCSVEmitsCoreColumns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("opening csv: %v", err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			t.Errorf("closing csv: %v", err)
+		}
+	}()
 
 	rows, err := csv.NewReader(file).ReadAll()
 	if err != nil {
@@ -210,7 +214,11 @@ func readHumanReadable(t *testing.T, path string, results []core.Result, showInf
 	if err != nil {
 		t.Fatalf("opening human-readable output: %v", err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			t.Errorf("closing human-readable output: %v", err)
+		}
+	}()
 
 	rows, err := csv.NewReader(file).ReadAll()
 	if err != nil {

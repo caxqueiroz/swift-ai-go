@@ -164,7 +164,7 @@ func (r *Runner) validateOutputs(data []string, emissions [][][]float64, country
 	if len(emissions) != len(data) {
 		return fmt.Errorf("inference emissions batch size %d does not match input batch size %d", len(emissions), len(data))
 	}
-	if countryLogits != nil && len(countryLogits) != 0 && len(countryLogits) != len(data) {
+	if len(countryLogits) != 0 && len(countryLogits) != len(data) {
 		return fmt.Errorf("country logits batch size %d does not match input batch size %d", len(countryLogits), len(data))
 	}
 

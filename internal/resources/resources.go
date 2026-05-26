@@ -50,13 +50,17 @@ func LoadCompressedJSON[T any](path string) (T, error) {
 	if err != nil {
 		return value, fmt.Errorf("open compressed JSON %q: %w", path, err)
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 
 	reader, err := zlib.NewReader(file)
 	if err != nil {
 		return value, fmt.Errorf("open zlib stream %q: %w", path, err)
 	}
-	defer reader.Close()
+	defer func() {
+		_ = reader.Close()
+	}()
 
 	if err := json.NewDecoder(reader).Decode(&value); err != nil {
 		return value, fmt.Errorf("decode compressed JSON %q: %w", path, err)
@@ -72,7 +76,9 @@ func LoadJSON[T any](path string) (T, error) {
 	if err != nil {
 		return value, fmt.Errorf("open JSON %q: %w", path, err)
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 
 	if err := json.NewDecoder(file).Decode(&value); err != nil {
 		return value, fmt.Errorf("decode JSON %q: %w", path, err)

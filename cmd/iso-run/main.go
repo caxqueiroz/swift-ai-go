@@ -51,7 +51,10 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		return 2
 	}
 	if opts.version {
-		fmt.Fprintln(stdout, version)
+		if _, err := fmt.Fprintln(stdout, version); err != nil {
+			logger.Error("write version", "error", err)
+			return 1
+		}
 		return 0
 	}
 

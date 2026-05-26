@@ -22,7 +22,9 @@ func ReadText(path string) ([]core.AddressSample, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open text file %q: %w", path, err)
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 
 	reader := bufio.NewReader(file)
 	var samples []core.AddressSample
@@ -51,7 +53,9 @@ func ReadDelimited(path string, comma rune, addressColumn string) ([]core.Addres
 	if err != nil {
 		return nil, fmt.Errorf("open delimited file %q: %w", path, err)
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 
 	reader := csv.NewReader(file)
 	reader.Comma = comma

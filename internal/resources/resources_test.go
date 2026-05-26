@@ -192,7 +192,11 @@ func writeCompressedJSON(t *testing.T, name string, value map[string][]string) s
 	if err != nil {
 		t.Fatalf("create compressed fixture: %v", err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			t.Errorf("close compressed fixture: %v", err)
+		}
+	}()
 
 	zw := zlib.NewWriter(file)
 	if err := json.NewEncoder(zw).Encode(value); err != nil {
@@ -213,7 +217,11 @@ func writeCompressedBytes(t *testing.T, name string, data []byte) string {
 	if err != nil {
 		t.Fatalf("create compressed fixture: %v", err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			t.Errorf("close compressed fixture: %v", err)
+		}
+	}()
 
 	zw := zlib.NewWriter(file)
 	if _, err := zw.Write(data); err != nil {
