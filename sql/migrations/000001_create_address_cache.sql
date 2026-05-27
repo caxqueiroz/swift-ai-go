@@ -22,6 +22,5 @@ CREATE INDEX IF NOT EXISTS address_cache_normalized_trgm_idx
 CREATE INDEX IF NOT EXISTS address_cache_source_idx
     ON address_cache (source);
 
--- Add a vector index after choosing a fixed embedding dimension/model, for example:
--- CREATE INDEX address_cache_embedding_cos_384_idx
---     ON address_cache USING ivfflat ((embedding::vector(384)) vector_cosine_ops) WITH (lists = 100);
+CREATE INDEX IF NOT EXISTS address_cache_embedding_cos_384_idx
+    ON address_cache USING ivfflat ((embedding::vector(384)) vector_cosine_ops) WITH (lists = 100);

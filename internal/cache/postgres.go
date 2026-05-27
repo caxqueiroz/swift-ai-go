@@ -9,11 +9,15 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/tipmarket/swift-ai/internal/cache/cachedb"
 )
 
 type PostgresStore struct {
-	pool *pgxpool.Pool
+	pool    *pgxpool.Pool
+	queries *cachedb.Queries
 }
 
 func NewPostgresStore(ctx context.Context, databaseURL string) (*PostgresStore, error) {
@@ -28,7 +32,10 @@ func NewPostgresStore(ctx context.Context, databaseURL string) (*PostgresStore, 
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	return &PostgresStore{pool: pool}, nil
+	return &PostgresStore{
+		pool:    pool,
+		queries: cachedb.New(pool),
+	}, nil
 }
 
 func (s *PostgresStore) Close() {
@@ -38,36 +45,32 @@ func (s *PostgresStore) Close() {
 }
 
 func (s *PostgresStore) LookupNormalized(ctx context.Context, normalizedAddress string) (Entry, bool, error) {
-	if s == nil || s.pool == nil {
+	if s == nil || s.queries == nil {
 		return Entry{}, false, errors.New("postgres store is nil")
 	}
 	if strings.TrimSpace(normalizedAddress) == "" {
 		return Entry{}, false, errors.New("normalized address is required")
 	}
 
-	var entry Entry
-	var source string
-	var structuredJSON []byte
-	err := s.pool.QueryRow(ctx, `
-SELECT raw_address, normalized_address, structured, source
-FROM address_cache
-WHERE normalized_address = $1
-`, normalizedAddress).Scan(&entry.RawAddress, &entry.NormalizedAddress, &structuredJSON, &source)
+	row, err := s.queries.LookupAddressCacheByNormalized(ctx, normalizedAddress)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Entry{}, false, nil
 		}
 		return Entry{}, false, fmt.Errorf("lookup normalized address: %w", err)
 	}
-	if err := json.Unmarshal(structuredJSON, &entry.Structured); err != nil {
+	var entry Entry
+	if err := json.Unmarshal(row.Structured, &entry.Structured); err != nil {
 		return Entry{}, false, fmt.Errorf("decode structured address: %w", err)
 	}
-	entry.Source = Source(source)
+	entry.RawAddress = row.RawAddress
+	entry.NormalizedAddress = row.NormalizedAddress
+	entry.Source = Source(row.Source)
 	return entry, true, nil
 }
 
 func (s *PostgresStore) Search(ctx context.Context, _ string, embedding []float64, limit int) ([]Candidate, error) {
-	if s == nil || s.pool == nil {
+	if s == nil || s.queries == nil {
 		return nil, errors.New("postgres store is nil")
 	}
 	if len(embedding) == 0 {
@@ -77,45 +80,30 @@ func (s *PostgresStore) Search(ctx context.Context, _ string, embedding []float6
 		limit = 5
 	}
 
-	rows, err := s.pool.Query(ctx, `
-SELECT
-	raw_address,
-	normalized_address,
-	structured,
-	source,
-	1 - (embedding <=> $1::vector) AS semantic_score
-FROM address_cache
-ORDER BY embedding <=> $1::vector
-LIMIT $2
-`, VectorLiteral(embedding), limit)
+	rows, err := s.queries.SearchAddressCache(ctx, cachedb.SearchAddressCacheParams{
+		Embedding:   VectorLiteral(embedding),
+		ResultLimit: int32(limit),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("search address cache: %w", err)
 	}
-	defer rows.Close()
 
 	candidates := make([]Candidate, 0, limit)
-	for rows.Next() {
+	for _, row := range rows {
 		var entry Entry
-		var source string
-		var structuredJSON []byte
-		var score float64
-		if err := rows.Scan(&entry.RawAddress, &entry.NormalizedAddress, &structuredJSON, &source, &score); err != nil {
-			return nil, fmt.Errorf("scan address cache row: %w", err)
-		}
-		if err := json.Unmarshal(structuredJSON, &entry.Structured); err != nil {
+		if err := json.Unmarshal(row.Structured, &entry.Structured); err != nil {
 			return nil, fmt.Errorf("decode structured address: %w", err)
 		}
-		entry.Source = Source(source)
-		candidates = append(candidates, Candidate{Entry: entry, SemanticScore: score})
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate address cache rows: %w", err)
+		entry.RawAddress = row.RawAddress
+		entry.NormalizedAddress = row.NormalizedAddress
+		entry.Source = Source(row.Source)
+		candidates = append(candidates, Candidate{Entry: entry, SemanticScore: row.SemanticScore})
 	}
 	return candidates, nil
 }
 
 func (s *PostgresStore) Upsert(ctx context.Context, entry Entry) error {
-	if s == nil || s.pool == nil {
+	if s == nil || s.queries == nil {
 		return errors.New("postgres store is nil")
 	}
 	if entry.NormalizedAddress == "" {
@@ -133,52 +121,24 @@ func (s *PostgresStore) Upsert(ctx context.Context, entry Entry) error {
 		return fmt.Errorf("encode structured address: %w", err)
 	}
 
-	_, err = s.pool.Exec(ctx, `
-INSERT INTO address_cache (
-	raw_address,
-	normalized_address,
-	embedding,
-	source,
-	structured,
-	country_code,
-	town,
-	postal_code,
-	street
-) VALUES ($1, $2, $3::vector, $4, $5::jsonb, $6, $7, $8, $9)
-ON CONFLICT (normalized_address) DO UPDATE SET
-	raw_address = EXCLUDED.raw_address,
-	embedding = EXCLUDED.embedding,
-	source = CASE
-		WHEN address_cache.source = 'human_verified' AND EXCLUDED.source <> 'human_verified' THEN address_cache.source
-		ELSE EXCLUDED.source
-	END,
-	structured = CASE
-		WHEN address_cache.source = 'human_verified' AND EXCLUDED.source <> 'human_verified' THEN address_cache.structured
-		ELSE EXCLUDED.structured
-	END,
-	country_code = CASE
-		WHEN address_cache.source = 'human_verified' AND EXCLUDED.source <> 'human_verified' THEN address_cache.country_code
-		ELSE EXCLUDED.country_code
-	END,
-	town = CASE
-		WHEN address_cache.source = 'human_verified' AND EXCLUDED.source <> 'human_verified' THEN address_cache.town
-		ELSE EXCLUDED.town
-	END,
-	postal_code = CASE
-		WHEN address_cache.source = 'human_verified' AND EXCLUDED.source <> 'human_verified' THEN address_cache.postal_code
-		ELSE EXCLUDED.postal_code
-	END,
-	street = CASE
-		WHEN address_cache.source = 'human_verified' AND EXCLUDED.source <> 'human_verified' THEN address_cache.street
-		ELSE EXCLUDED.street
-	END,
-	updated_at = now()
-`, entry.RawAddress, entry.NormalizedAddress, VectorLiteral(entry.Embedding), string(entry.Source), structuredJSON,
-		entry.Structured.Country, entry.Structured.Town, entry.Structured.PostalCode, entry.Structured.Street)
-	if err != nil {
+	if err := s.queries.UpsertAddressCache(ctx, cachedb.UpsertAddressCacheParams{
+		RawAddress:        entry.RawAddress,
+		NormalizedAddress: entry.NormalizedAddress,
+		Embedding:         VectorLiteral(entry.Embedding),
+		Source:            string(entry.Source),
+		Structured:        structuredJSON,
+		CountryCode:       textValue(entry.Structured.Country),
+		Town:              textValue(entry.Structured.Town),
+		PostalCode:        textValue(entry.Structured.PostalCode),
+		Street:            textValue(entry.Structured.Street),
+	}); err != nil {
 		return fmt.Errorf("upsert address cache: %w", err)
 	}
 	return nil
+}
+
+func textValue(value string) pgtype.Text {
+	return pgtype.Text{String: value, Valid: true}
 }
 
 func VectorLiteral(vector []float64) string {

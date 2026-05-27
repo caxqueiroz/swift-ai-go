@@ -1,4 +1,4 @@
-.PHONY: test build build-api build-cache-fill lint tidy serve migrate-up
+.PHONY: test build build-api build-cache-fill generate sqlc-generate lint tidy serve migrate-up
 
 test:
 	go test ./...
@@ -13,6 +13,11 @@ build-api:
 
 build-cache-fill:
 	go build ./cmd/iso-cache-fill
+
+generate: sqlc-generate
+
+sqlc-generate:
+	sqlc generate
 
 serve:
 	go run ./cmd/iso-api

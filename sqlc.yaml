@@ -1,0 +1,18 @@
+version: "2"
+sql:
+  - engine: postgresql
+    schema:
+      - sql/migrations/000001_create_address_cache.sql
+    queries:
+      - sql/queries
+    gen:
+      go:
+        package: cachedb
+        out: internal/cache/cachedb
+        sql_package: pgx/v5
+        emit_json_tags: true
+        emit_interface: true
+        overrides:
+          - db_type: vector
+            go_type:
+              type: string
