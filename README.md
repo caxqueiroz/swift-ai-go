@@ -77,6 +77,10 @@ make migrate-up
 make lint
 ```
 
+## Detailed Runbook
+
+The full cache and evaluation workflow is documented in [docs/offline-cache-and-evaluation.md](docs/offline-cache-and-evaluation.md). It covers DataAddr, GeoNames, confidence thresholds, offline LLM judging, cache creation, SQLite shard evaluation, and holdout strategy.
+
 ## Convert The Model
 
 ```bash
