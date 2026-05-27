@@ -14,6 +14,7 @@ vars:
   PG0_PASSWORD: postgres
   PG0_DATA_DIR: /private/tmp/swift-ai-pg0/data
   PG0_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/swift_ai
+  DATAADDR_SQLITE: /Volumes/cax-t7/Data/DataAddr/addresses.sqlite
   MINILM_DIR: resources/embeddings/all-MiniLM-L6-v2
   ONNXRUNTIME_VERSION: 1.26.0
   ONNXRUNTIME_OSX_ARM64_DIR: .onnxruntime/onnxruntime-osx-arm64-{{.ONNXRUNTIME_VERSION}}
@@ -125,6 +126,22 @@ tasks:
         {{if .MAX_RECORDS}}--max-records {{.MAX_RECORDS}}{{end}}
         {{if .ENABLE_LLM_JUDGE}}--enable-llm-judge --judge-model {{.JUDGE_MODEL}}{{end}}
         {{if .REVIEW_PATH}}--review-path {{.REVIEW_PATH}}{{end}}
+
+  eval:dataaddr-client:
+    desc: Evaluate /convert against a stratified sample from DataAddr SQLite
+    cmds:
+      - >
+        env GOCACHE={{.GO_CACHE}} GOMODCACHE={{.GO_MOD_CACHE}}
+        go run ./examples/client
+        --sqlite {{.SQLITE | default .DATAADDR_SQLITE}}
+        --api-url {{.API_URL | default "http://localhost:8080/convert"}}
+        --limit {{.LIMIT | default 1000}}
+        --batch-size {{.BATCH_SIZE | default 50}}
+        --seed {{.SEED | default 42}}
+        --input-mode {{.INPUT_MODE | default "address-town"}}
+        {{if .COUNTRY}}--country {{.COUNTRY}}{{end}}
+        {{if .MISMATCHES}}--mismatches {{.MISMATCHES}}{{end}}
+        {{if .INCLUDE_BLANK_TOWN}}--include-blank-town{{end}}
 
   lint:
     desc: Run Go linters

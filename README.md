@@ -21,6 +21,7 @@ The upstream resource files and trained model weights are not vendored here. You
 | `cmd/iso-run` | Batch CLI for file input/output. |
 | `cmd/iso-api` | HTTP server exposing `POST /convert`. |
 | `cmd/iso-cache-fill` | Offline command to fill the semantic cache from a corpus. |
+| `examples/client` | Stratified DataAddr SQLite evaluator for `/convert`. |
 | `internal/api` | JSON request/response handling. |
 | `internal/cascade` | Stage 1 cache gate, Stage 2 fallback, provenance policy, write-back. |
 | `internal/cache` | Postgres/pgvector cache implementation. |
@@ -63,6 +64,7 @@ task build-api     # build only iso-api
 task build-cache-fill
 task embeddings:download-minilm
 task onnxruntime:download-darwin-arm64
+task eval:dataaddr-client
 ```
 
 Equivalent Make targets are available:
@@ -388,6 +390,26 @@ task cache-fill:dataaddr-local COUNTRY=SG \
 ```
 
 For DataAddr directory input, the parent country folder is used only as an offline batch hint to improve GeoNames disambiguation. `/convert` still accepts free text only and infers country/town itself.
+
+## Evaluate Against DataAddr SQLite
+
+`examples/client` samples from `/Volumes/cax-t7/Data/DataAddr/addresses.sqlite`, calls `/convert`, and compares API output against SQLite `country` and `town`. Postcode is intentionally ignored because the SQLite file can be sparse for postcode.
+
+For resolver quality, run the API without `DATABASE_URL` so Stage 1 cache is disabled:
+
+```bash
+ISO20022_ONNX_RUNTIME=$PWD/.onnxruntime/onnxruntime-osx-arm64-1.26.0/lib/libonnxruntime.1.26.0.dylib \
+EMBEDDING_BACKEND=onnx \
+go run ./cmd/iso-api --resources-dir resources --model-dir resources/models
+```
+
+Then run a stratified sample:
+
+```bash
+task eval:dataaddr-client COUNTRY=SG LIMIT=1000 MISMATCHES=/tmp/convert-mismatches-sg.jsonl
+```
+
+For cache behavior, run the API with `DATABASE_URL`. Keep a holdout sample out of cache-fill; testing on rows already cached from the same SQLite source measures cache lookup, not resolver correctness.
 
 ## Parity Check
 
