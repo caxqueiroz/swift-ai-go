@@ -29,6 +29,7 @@ type Candidate struct {
 }
 
 type Store interface {
+	LookupNormalized(ctx context.Context, normalizedAddress string) (Entry, bool, error)
 	Search(ctx context.Context, normalizedAddress string, embedding []float64, limit int) ([]Candidate, error)
 	Upsert(ctx context.Context, entry Entry) error
 }

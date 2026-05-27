@@ -19,23 +19,26 @@ import (
 	"github.com/tipmarket/swift-ai/internal/config"
 	"github.com/tipmarket/swift-ai/internal/embedding"
 	"github.com/tipmarket/swift-ai/internal/pipeline"
+	"github.com/tipmarket/swift-ai/internal/quality"
 	isoruntime "github.com/tipmarket/swift-ai/internal/runtime"
 )
 
 type options struct {
-	addr                string
-	resourcesDir        string
-	modelDir            string
-	databaseURL         string
-	embeddingAPIKey     string
-	embeddingBaseURL    string
-	embeddingModel      string
-	embeddingDimensions int
-	batchSize           int
-	semanticThreshold   float64
-	lexicalThreshold    float64
-	trustSonnetSeed     bool
-	trustLLMAssisted    bool
+	addr                      string
+	resourcesDir              string
+	modelDir                  string
+	databaseURL               string
+	embeddingAPIKey           string
+	embeddingBaseURL          string
+	embeddingModel            string
+	embeddingDimensions       int
+	batchSize                 int
+	semanticThreshold         float64
+	lexicalThreshold          float64
+	highConfidenceThreshold   float64
+	mediumConfidenceThreshold float64
+	trustSonnetSeed           bool
+	trustLLMAssisted          bool
 }
 
 func main() {
@@ -82,6 +85,10 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			SearchLimit:       5,
 			TrustSonnetSeed:   opts.trustSonnetSeed,
 			TrustLLMAssisted:  opts.trustLLMAssisted,
+			QualityThresholds: quality.Thresholds{
+				High:   opts.highConfidenceThreshold,
+				Medium: opts.mediumConfidenceThreshold,
+			},
 		}),
 	}
 	store, embedder, closeCache, err := stage1Dependencies(ctx, opts)
@@ -124,15 +131,17 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 func parseArgs(args []string, stderr io.Writer) (options, error) {
 	cfg := config.Default()
 	opts := options{
-		addr:              defaultAddr(),
-		resourcesDir:      envDefault("ISO20022_RESOURCES_DIR", cfg.Database.PrefixFolderPath),
-		databaseURL:       os.Getenv("DATABASE_URL"),
-		embeddingAPIKey:   os.Getenv("OPENAI_API_KEY"),
-		embeddingBaseURL:  envDefault("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-		embeddingModel:    os.Getenv("EMBEDDING_MODEL"),
-		batchSize:         cfg.BatchSize,
-		semanticThreshold: 0.90,
-		lexicalThreshold:  0.85,
+		addr:                      defaultAddr(),
+		resourcesDir:              envDefault("ISO20022_RESOURCES_DIR", cfg.Database.PrefixFolderPath),
+		databaseURL:               os.Getenv("DATABASE_URL"),
+		embeddingAPIKey:           os.Getenv("OPENAI_API_KEY"),
+		embeddingBaseURL:          envDefault("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+		embeddingModel:            os.Getenv("EMBEDDING_MODEL"),
+		batchSize:                 cfg.BatchSize,
+		semanticThreshold:         0.90,
+		lexicalThreshold:          0.85,
+		highConfidenceThreshold:   quality.DefaultThresholds().High,
+		mediumConfidenceThreshold: quality.DefaultThresholds().Medium,
 	}
 	if value := os.Getenv("EMBEDDING_DIMENSIONS"); value != "" {
 		dimensions, err := strconv.Atoi(value)
@@ -155,6 +164,8 @@ func parseArgs(args []string, stderr io.Writer) (options, error) {
 	fs.IntVar(&opts.embeddingDimensions, "embedding-dimensions", opts.embeddingDimensions, "optional embedding dimensions")
 	fs.Float64Var(&opts.semanticThreshold, "semantic-threshold", opts.semanticThreshold, "minimum cosine similarity for Stage 1")
 	fs.Float64Var(&opts.lexicalThreshold, "lexical-threshold", opts.lexicalThreshold, "minimum lexical identity for Stage 1")
+	fs.Float64Var(&opts.highConfidenceThreshold, "high-confidence-threshold", opts.highConfidenceThreshold, "minimum country/town confidence for resolved status")
+	fs.Float64Var(&opts.mediumConfidenceThreshold, "medium-confidence-threshold", opts.mediumConfidenceThreshold, "minimum confidence for medium band")
 	fs.BoolVar(&opts.trustSonnetSeed, "trust-sonnet-seed", false, "allow sonnet_seed cache rows to serve directly")
 	fs.BoolVar(&opts.trustLLMAssisted, "trust-llm-assisted", false, "allow llm_assisted cache rows to serve directly")
 	if err := fs.Parse(args); err != nil {

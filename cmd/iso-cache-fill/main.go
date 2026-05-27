@@ -18,26 +18,34 @@ import (
 	"github.com/tipmarket/swift-ai/internal/config"
 	"github.com/tipmarket/swift-ai/internal/core"
 	"github.com/tipmarket/swift-ai/internal/embedding"
+	judgepkg "github.com/tipmarket/swift-ai/internal/judge"
 	"github.com/tipmarket/swift-ai/internal/pipeline"
+	"github.com/tipmarket/swift-ai/internal/quality"
 	"github.com/tipmarket/swift-ai/internal/readers"
 	isoruntime "github.com/tipmarket/swift-ai/internal/runtime"
 	"github.com/tipmarket/swift-ai/internal/structured"
 )
 
 type fillOptions struct {
-	inputPath           string
-	resourcesDir        string
-	modelDir            string
-	databaseURL         string
-	embeddingAPIKey     string
-	embeddingBaseURL    string
-	embeddingModel      string
-	embeddingDimensions int
-	batchSize           int
-	minCacheConfidence  float64
-	reviewThreshold     float64
-	reviewPath          string
-	dryRun              bool
+	inputPath                 string
+	resourcesDir              string
+	modelDir                  string
+	databaseURL               string
+	embeddingAPIKey           string
+	embeddingBaseURL          string
+	embeddingModel            string
+	embeddingDimensions       int
+	enableLLMJudge            bool
+	judgeAPIKey               string
+	judgeBaseURL              string
+	judgeModel                string
+	batchSize                 int
+	minCacheConfidence        float64
+	reviewThreshold           float64
+	highConfidenceThreshold   float64
+	mediumConfidenceThreshold float64
+	reviewPath                string
+	dryRun                    bool
 }
 
 func main() {
@@ -91,6 +99,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 
 	var store *cache.PostgresStore
 	var embedder *embedding.OpenAICompatible
+	var adjudicator judgepkg.Client
 	if !opts.dryRun {
 		store, embedder, err = fillDependencies(ctx, opts)
 		if err != nil {
@@ -99,8 +108,15 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		}
 		defer store.Close()
 	}
+	if opts.enableLLMJudge {
+		adjudicator, err = judgeDependency(opts)
+		if err != nil {
+			logger.Error("configure judge", "error", err)
+			return 1
+		}
+	}
 
-	summary, err := fillCache(ctx, samples, results, store, embedder, opts)
+	summary, err := fillCache(ctx, samples, results, store, embedder, adjudicator, opts)
 	if err != nil {
 		logger.Error("fill cache", "error", err)
 		return 1
@@ -123,15 +139,20 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 func parseArgs(args []string, stderr io.Writer) (fillOptions, error) {
 	cfg := config.Default()
 	opts := fillOptions{
-		resourcesDir:        envDefault("ISO20022_RESOURCES_DIR", cfg.Database.PrefixFolderPath),
-		databaseURL:         os.Getenv("DATABASE_URL"),
-		embeddingAPIKey:     os.Getenv("OPENAI_API_KEY"),
-		embeddingBaseURL:    envDefault("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-		embeddingModel:      os.Getenv("EMBEDDING_MODEL"),
-		batchSize:           cfg.BatchSize,
-		minCacheConfidence:  0,
-		reviewThreshold:     0.85,
-		embeddingDimensions: 0,
+		resourcesDir:              envDefault("ISO20022_RESOURCES_DIR", cfg.Database.PrefixFolderPath),
+		databaseURL:               os.Getenv("DATABASE_URL"),
+		embeddingAPIKey:           os.Getenv("OPENAI_API_KEY"),
+		embeddingBaseURL:          envDefault("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+		embeddingModel:            os.Getenv("EMBEDDING_MODEL"),
+		judgeAPIKey:               envDefault("JUDGE_API_KEY", os.Getenv("OPENAI_API_KEY")),
+		judgeBaseURL:              envDefault("JUDGE_BASE_URL", envDefault("OPENAI_BASE_URL", "https://api.openai.com/v1")),
+		judgeModel:                os.Getenv("JUDGE_MODEL"),
+		batchSize:                 cfg.BatchSize,
+		minCacheConfidence:        0,
+		reviewThreshold:           0.85,
+		highConfidenceThreshold:   quality.DefaultThresholds().High,
+		mediumConfidenceThreshold: quality.DefaultThresholds().Medium,
+		embeddingDimensions:       0,
 	}
 	if value := os.Getenv("EMBEDDING_DIMENSIONS"); value != "" {
 		dimensions, err := strconv.Atoi(value)
@@ -153,8 +174,14 @@ func parseArgs(args []string, stderr io.Writer) (fillOptions, error) {
 	fs.StringVar(&opts.embeddingBaseURL, "embedding-base-url", opts.embeddingBaseURL, "OpenAI-compatible base URL")
 	fs.StringVar(&opts.embeddingModel, "embedding-model", opts.embeddingModel, "embedding model name")
 	fs.IntVar(&opts.embeddingDimensions, "embedding-dimensions", opts.embeddingDimensions, "optional embedding dimensions")
+	fs.BoolVar(&opts.enableLLMJudge, "enable-llm-judge", opts.enableLLMJudge, "use constrained LLM judge for non-high-confidence rows")
+	fs.StringVar(&opts.judgeAPIKey, "judge-api-key", opts.judgeAPIKey, "OpenAI-compatible judge API key")
+	fs.StringVar(&opts.judgeBaseURL, "judge-base-url", opts.judgeBaseURL, "OpenAI-compatible judge base URL")
+	fs.StringVar(&opts.judgeModel, "judge-model", opts.judgeModel, "LLM judge model name")
 	fs.Float64Var(&opts.minCacheConfidence, "min-cache-confidence", opts.minCacheConfidence, "minimum country/town confidence to cache")
 	fs.Float64Var(&opts.reviewThreshold, "review-threshold", opts.reviewThreshold, "confidence threshold for review export")
+	fs.Float64Var(&opts.highConfidenceThreshold, "high-confidence-threshold", opts.highConfidenceThreshold, "minimum country/town confidence to cache Swift output directly")
+	fs.Float64Var(&opts.mediumConfidenceThreshold, "medium-confidence-threshold", opts.mediumConfidenceThreshold, "minimum country/town confidence for medium-band review")
 	fs.StringVar(&opts.reviewPath, "review-path", "", "optional JSON path for ambiguous rows")
 	fs.BoolVar(&opts.dryRun, "dry-run", false, "run pipeline and review export without writing cache")
 	if err := fs.Parse(args); err != nil {
@@ -172,6 +199,14 @@ func parseArgs(args []string, stderr io.Writer) (fillOptions, error) {
 		}
 		if opts.embeddingModel == "" {
 			return fillOptions{}, errors.New("embedding model is required unless --dry-run is set")
+		}
+	}
+	if opts.enableLLMJudge {
+		if opts.judgeAPIKey == "" {
+			return fillOptions{}, errors.New("judge API key is required when --enable-llm-judge is set")
+		}
+		if opts.judgeModel == "" {
+			return fillOptions{}, errors.New("judge model is required when --enable-llm-judge is set")
 		}
 	}
 	return opts, nil
@@ -208,6 +243,22 @@ func fillDependencies(ctx context.Context, opts fillOptions) (*cache.PostgresSto
 	return store, embedder, nil
 }
 
+func judgeDependency(opts fillOptions) (judgepkg.Client, error) {
+	return judgepkg.NewOpenAICompatible(judgepkg.Config{
+		APIKey:  opts.judgeAPIKey,
+		BaseURL: opts.judgeBaseURL,
+		Model:   opts.judgeModel,
+	})
+}
+
+type cacheWriter interface {
+	Upsert(ctx context.Context, entry cache.Entry) error
+}
+
+type cacheEmbedder interface {
+	Embed(ctx context.Context, text string) ([]float64, error)
+}
+
 type fillSummary struct {
 	Processed  int
 	Cached     int
@@ -224,7 +275,7 @@ type reviewRow struct {
 	Reason            string  `json:"reason"`
 }
 
-func fillCache(ctx context.Context, samples []core.AddressSample, results []core.Result, store *cache.PostgresStore, embedder *embedding.OpenAICompatible, opts fillOptions) (fillSummary, error) {
+func fillCache(ctx context.Context, samples []core.AddressSample, results []core.Result, store cacheWriter, embedder cacheEmbedder, adjudicator judgepkg.Client, opts fillOptions) (fillSummary, error) {
 	if len(samples) != len(results) {
 		return fillSummary{}, fmt.Errorf("sample/result length mismatch: %d samples, %d results", len(samples), len(results))
 	}
@@ -232,34 +283,133 @@ func fillCache(ctx context.Context, samples []core.AddressSample, results []core
 	summary := fillSummary{Processed: len(samples)}
 	for i, result := range results {
 		address := structured.FromResult(result)
-		if reviewReason(address, opts.reviewThreshold) != "" {
-			summary.ReviewRows = append(summary.ReviewRows, newReviewRow(samples[i].Text, address, reviewReason(address, opts.reviewThreshold)))
-		}
-		if !cacheable(address, opts.minCacheConfidence) {
-			summary.Skipped++
-			continue
-		}
-		if opts.dryRun {
+		assessment := quality.Assess(address, quality.Thresholds{
+			High:   opts.highConfidenceThreshold,
+			Medium: opts.mediumConfidenceThreshold,
+		})
+
+		if assessment.Status == quality.StatusResolved && assessment.Band == quality.BandHigh {
+			cached, err := writeCacheEntry(ctx, samples[i].Text, address, cache.SourceCRFPipeline, store, embedder, opts)
+			if err != nil {
+				return summary, fmt.Errorf("cache high-confidence sample %d: %w", i, err)
+			}
+			if cached {
+				summary.Cached++
+			}
 			continue
 		}
 
-		normalized := cascade.NormalizeAddress(samples[i].Text)
-		vector, err := embedder.Embed(ctx, normalized)
-		if err != nil {
-			return summary, fmt.Errorf("embed sample %d: %w", i, err)
+		if adjudicator != nil {
+			request := newJudgeRequest(samples[i].Text, result)
+			decision, err := adjudicator.Judge(ctx, request)
+			if err != nil {
+				return summary, fmt.Errorf("judge sample %d: %w", i, err)
+			}
+			if valid, ok := judgepkg.ValidateDecision(request, decision); ok {
+				judged := applyDecision(address, request, valid)
+				cached, err := writeCacheEntry(ctx, samples[i].Text, judged, cache.SourceLLMAssisted, store, embedder, opts)
+				if err != nil {
+					return summary, fmt.Errorf("cache judged sample %d: %w", i, err)
+				}
+				if cached {
+					summary.Cached++
+				}
+				continue
+			}
+			summary.ReviewRows = append(summary.ReviewRows, newReviewRow(samples[i].Text, address, "judge_unresolved"))
+			summary.Skipped++
+			continue
 		}
-		if err := store.Upsert(ctx, cache.Entry{
-			RawAddress:        samples[i].Text,
-			NormalizedAddress: normalized,
-			Structured:        address,
-			Source:            cache.SourceCRFPipeline,
-			Embedding:         vector,
-		}); err != nil {
-			return summary, fmt.Errorf("upsert sample %d: %w", i, err)
+
+		reason := reviewReason(address, opts.reviewThreshold)
+		if reason == "" {
+			reason = string(assessment.Reason)
 		}
-		summary.Cached++
+		summary.ReviewRows = append(summary.ReviewRows, newReviewRow(samples[i].Text, address, reason))
+		summary.Skipped++
 	}
 	return summary, nil
+}
+
+func writeCacheEntry(ctx context.Context, input string, address structured.Address, source cache.Source, store cacheWriter, embedder cacheEmbedder, opts fillOptions) (bool, error) {
+	if !cacheable(address, opts.minCacheConfidence) {
+		return false, nil
+	}
+	if opts.dryRun {
+		return false, nil
+	}
+	if store == nil || embedder == nil {
+		return false, errors.New("cache writer and embedder are required")
+	}
+
+	normalized := cascade.NormalizeAddress(input)
+	vector, err := embedder.Embed(ctx, normalized)
+	if err != nil {
+		return false, fmt.Errorf("embed address: %w", err)
+	}
+	if err := store.Upsert(ctx, cache.Entry{
+		RawAddress:        input,
+		NormalizedAddress: normalized,
+		Structured:        address,
+		Source:            source,
+		Embedding:         vector,
+	}); err != nil {
+		return false, fmt.Errorf("upsert address cache: %w", err)
+	}
+	return true, nil
+}
+
+func newJudgeRequest(input string, result core.Result) judgepkg.Request {
+	request := judgepkg.Request{
+		Input: input,
+	}
+	for _, match := range result.FuzzyResult.CountryMatches {
+		if match.Origin == "" || match.Origin == "NO COUNTRY" {
+			continue
+		}
+		request.Countries = append(request.Countries, judgepkg.CountryCandidate{
+			Code:        match.Origin,
+			Score:       match.FinalScore,
+			Matched:     match.Matched,
+			Possibility: match.Possibility,
+		})
+		if len(request.Countries) == 5 {
+			break
+		}
+	}
+	for _, match := range result.FuzzyResult.TownMatches {
+		if match.Possibility == "" || match.Possibility == "NO TOWN" || match.Origin == "NO TOWN" {
+			continue
+		}
+		request.Towns = append(request.Towns, judgepkg.TownCandidate{
+			Name:        match.Possibility,
+			CountryCode: match.Origin,
+			Score:       match.FinalScore,
+			Matched:     match.Matched,
+		})
+		if len(request.Towns) == 5 {
+			break
+		}
+	}
+	return request
+}
+
+func applyDecision(address structured.Address, request judgepkg.Request, decision judgepkg.Decision) structured.Address {
+	address.Country = decision.Country
+	address.Town = decision.Town
+	for _, candidate := range request.Countries {
+		if strings.EqualFold(candidate.Code, decision.Country) {
+			address.CountryConfidence = candidate.Score
+			break
+		}
+	}
+	for _, candidate := range request.Towns {
+		if strings.EqualFold(candidate.Name, decision.Town) && strings.EqualFold(candidate.CountryCode, decision.Country) {
+			address.TownConfidence = candidate.Score
+			break
+		}
+	}
+	return address
 }
 
 func cacheable(address structured.Address, minConfidence float64) bool {

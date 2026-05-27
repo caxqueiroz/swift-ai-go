@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -34,6 +35,35 @@ func (s *PostgresStore) Close() {
 	if s != nil && s.pool != nil {
 		s.pool.Close()
 	}
+}
+
+func (s *PostgresStore) LookupNormalized(ctx context.Context, normalizedAddress string) (Entry, bool, error) {
+	if s == nil || s.pool == nil {
+		return Entry{}, false, errors.New("postgres store is nil")
+	}
+	if strings.TrimSpace(normalizedAddress) == "" {
+		return Entry{}, false, errors.New("normalized address is required")
+	}
+
+	var entry Entry
+	var source string
+	var structuredJSON []byte
+	err := s.pool.QueryRow(ctx, `
+SELECT raw_address, normalized_address, structured, source
+FROM address_cache
+WHERE normalized_address = $1
+`, normalizedAddress).Scan(&entry.RawAddress, &entry.NormalizedAddress, &structuredJSON, &source)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Entry{}, false, nil
+		}
+		return Entry{}, false, fmt.Errorf("lookup normalized address: %w", err)
+	}
+	if err := json.Unmarshal(structuredJSON, &entry.Structured); err != nil {
+		return Entry{}, false, fmt.Errorf("decode structured address: %w", err)
+	}
+	entry.Source = Source(source)
+	return entry, true, nil
 }
 
 func (s *PostgresStore) Search(ctx context.Context, _ string, embedding []float64, limit int) ([]Candidate, error) {

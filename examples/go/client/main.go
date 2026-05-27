@@ -17,9 +17,11 @@ type convertResponse struct {
 }
 
 type convertItem struct {
-	Input      string            `json:"input"`
-	Structured structuredAddress `json:"structured"`
-	ServedBy   string            `json:"served_by"`
+	Input            string            `json:"input"`
+	Structured       structuredAddress `json:"structured"`
+	ServedBy         string            `json:"served_by"`
+	ResolutionStatus string            `json:"resolution_status"`
+	ConfidenceBand   string            `json:"confidence_band"`
 }
 
 type structuredAddress struct {
@@ -50,7 +52,7 @@ func main() {
 		log.Fatal(err)
 	}
 	for _, item := range payload.Items {
-		fmt.Printf("%s -> country=%s town=%s served_by=%s\n",
-			item.Input, item.Structured.Country, item.Structured.Town, item.ServedBy)
+		fmt.Printf("%s -> country=%s town=%s served_by=%s status=%s band=%s\n",
+			item.Input, item.Structured.Country, item.Structured.Town, item.ServedBy, item.ResolutionStatus, item.ConfidenceBand)
 	}
 }

@@ -8,10 +8,11 @@ The upstream resource files and trained model weights are not vendored here. You
 
 - Converts free-form postal address text into structured fields.
 - Resolves country and town through the pipeline. API callers do not pass country hints.
-- Uses Stage 1 semantic search only as a gated cache lookup.
-- Uses Stage 2 CRF + GeoNames as the authoritative resolver.
-- Writes Stage 2 results back into the cache as `crf_pipeline`.
-- Supports offline cache fill and ambiguous-row review export.
+- Keeps the API fast by checking trusted cache rows before live inference.
+- Uses the Swift/CRF + GeoNames pipeline as the live resolver on cache misses.
+- Uses LLMs only in offline cache fill, as constrained judges over GeoNames-backed candidates.
+- Writes live or batch Swift results back into the cache as `crf_pipeline`.
+- Supports confidence banding, LLM-assisted cache fill, and ambiguous-row review export.
 
 ## Layout
 
@@ -98,7 +99,7 @@ Output supports `.csv`, `.tsv`, and `.json`. Pass `--verbose` to include CRF emi
 
 ## Run The Convert API
 
-`POST /convert` accepts free text only. Do not send `suggested_country` or `force_suggested_country`; country and town are resolved by Stage 1 cache or Stage 2 pipeline.
+`POST /convert` accepts free text only. Do not send `suggested_country` or `force_suggested_country`; country and town are resolved by trusted cache or the Swift/CRF + GeoNames pipeline.
 
 ```bash
 ISO20022_ONNX_RUNTIME=/path/to/libonnxruntime.so \
@@ -109,7 +110,7 @@ EMBEDDING_MODEL=text-embedding-model \
 go run ./cmd/iso-api --model-dir resources/models
 ```
 
-If `DATABASE_URL`, `OPENAI_API_KEY`, or `EMBEDDING_MODEL` is missing, the API still works through Stage 2 and disables Stage 1 semantic cache.
+If `DATABASE_URL`, `OPENAI_API_KEY`, or `EMBEDDING_MODEL` is missing, the API still works through live Swift/CRF + GeoNames inference and disables semantic cache lookup.
 
 ### Single Request
 
@@ -147,6 +148,8 @@ The API always returns `items`, even for a single request.
       },
       "served_by": "stage2_pipeline",
       "cache_source": "crf_pipeline",
+      "resolution_status": "resolved",
+      "confidence_band": "high",
       "fallback_reason": "cache_miss"
     }
   ]
@@ -167,30 +170,41 @@ The API always returns `items`, even for a single request.
 
 By default, only `human_verified` and `crf_pipeline` rows can serve directly from Stage 1.
 
+`resolution_status` is:
+
+- `resolved`: country and town are present and above the high-confidence threshold.
+- `partial`: only country or town is present.
+- `needs_review`: complete but below the high threshold, or too weak to trust.
+
+`confidence_band` is:
+
+- `high`: default `>= 0.95`
+- `medium`: default `>= 0.80` and `< 0.95`
+- `low`: below `0.80`, or missing both country and town
+
 ## Serving Cascade
 
-The runtime flow is:
+The online runtime flow is optimized for low latency:
 
 ```text
 Request text
   -> normalize text
-  -> Stage 1 semantic search in pgvector
-  -> cosine gate
-  -> lexical identity gate
-  -> provenance gate
+  -> exact normalized trusted cache lookup
+  -> semantic cache lookup in pgvector, if exact miss
+  -> cosine + lexical + provenance gates
   -> serve trusted near-exact cache hit
-  -> otherwise Stage 2 CRF + GeoNames pipeline
-  -> write Stage 2 result back as crf_pipeline
+  -> otherwise run Swift/CRF + GeoNames live
+  -> write live result back as crf_pipeline when embedding is available
   -> response
 ```
 
-Stage 1 is not the resolver. It is a near-exact memoization layer. A cache row serves only when:
+The cache is not the resolver. It is a near-exact memoization layer. A semantic cache row serves only when:
 
 - semantic score is at least `--semantic-threshold` (default `0.90`)
 - lexical identity is at least `--lexical-threshold` (default `0.85`)
 - source provenance is trusted
 
-Any miss, low lexical score, low semantic score, untrusted source, embedding error, or cache error falls through to Stage 2.
+Any miss, low lexical score, low semantic score, untrusted source, embedding error, or cache error falls through to live Swift/CRF + GeoNames. The online API does not call an LLM by default.
 
 ## Environment Variables
 
@@ -203,6 +217,9 @@ Any miss, low lexical score, low semantic score, untrusted source, embedding err
 | `OPENAI_BASE_URL` | No | Embedding API base URL. Defaults to `https://api.openai.com/v1`. |
 | `EMBEDDING_MODEL` | Stage 1 only | Embedding model name. |
 | `EMBEDDING_DIMENSIONS` | No | Optional embedding dimensions. |
+| `JUDGE_API_KEY` | Cache fill only | API key for offline LLM judge. Defaults to `OPENAI_API_KEY`. |
+| `JUDGE_BASE_URL` | Cache fill only | Judge API base URL. Defaults to `OPENAI_BASE_URL`. |
+| `JUDGE_MODEL` | Cache fill only | LLM judge model name. |
 | `PORT` | No | HTTP port. Defaults to `8080`. |
 | `ADDR` | No | Full HTTP listen address, overrides `PORT`. |
 
@@ -225,7 +242,7 @@ The migration creates:
 
 ## Fill The Semantic Cache
 
-Use `iso-cache-fill` to run Stage 2 over a corpus and write outputs into `address_cache` as `crf_pipeline`.
+Use `iso-cache-fill` to run the Swift/CRF + GeoNames pipeline over a corpus and write high-confidence outputs into `address_cache` as `crf_pipeline`. Rows below the high threshold can be sent to an offline LLM judge.
 
 ```bash
 ISO20022_ONNX_RUNTIME=/path/to/libonnxruntime.so \
@@ -236,8 +253,11 @@ go run ./cmd/iso-cache-fill \
   --database-url "$DATABASE_URL" \
   --embedding-api-key "$OPENAI_API_KEY" \
   --embedding-model "$EMBEDDING_MODEL" \
+  --enable-llm-judge \
+  --judge-model "$JUDGE_MODEL" \
   --review-path /tmp/address-review.json \
-  --review-threshold 0.85
+  --high-confidence-threshold 0.95 \
+  --medium-confidence-threshold 0.80
 ```
 
 Useful flags:
@@ -245,17 +265,23 @@ Useful flags:
 | Flag | Purpose |
 |------|---------|
 | `--dry-run` | Run Stage 2 and review export without writing cache. |
-| `--min-cache-confidence` | Skip cache writes below a country/town confidence threshold. |
-| `--review-threshold` | Export rows below this confidence to review JSON. |
+| `--high-confidence-threshold` | Minimum country/town confidence for direct `crf_pipeline` cache writes. Default `0.95`. |
+| `--medium-confidence-threshold` | Lower band boundary for uncertain but potentially judgeable rows. Default `0.80`. |
+| `--enable-llm-judge` | Send non-high-confidence rows to the constrained LLM judge. |
+| `--judge-model` | LLM model used for offline judging. |
+| `--min-cache-confidence` | Optional extra floor below which cache writes are skipped. |
+| `--review-threshold` | Legacy review-export confidence threshold when no judge is configured. |
 | `--review-path` | JSON file for ambiguous rows. |
 
 The cache-fill path does not treat LLM output as truth. The recommended flow is:
 
-1. Run Stage 2 over the corpus.
+1. Run Swift/CRF + GeoNames over the corpus.
 2. Cache high-confidence rows as `crf_pipeline`.
-3. Export ambiguous rows for review.
-4. Use an LLM only as a constrained judge over GeoNames-backed candidates.
-5. Keep LLM-reviewed rows as `llm_assisted` unless a human promotes them to `human_verified`.
+3. Send non-high-confidence rows to an LLM judge only with GeoNames-backed country/town candidates.
+4. Reject any LLM answer that invents a country/town or mismatches town-country.
+5. Cache valid LLM-reviewed rows as `llm_assisted`.
+6. Export unresolved rows for human review.
+7. Promote rows to `human_verified` only after human review.
 
 ## Parity Check
 

@@ -8,23 +8,28 @@ import (
 	"github.com/tipmarket/swift-ai/internal/cache"
 	"github.com/tipmarket/swift-ai/internal/cascade"
 	"github.com/tipmarket/swift-ai/internal/core"
+	"github.com/tipmarket/swift-ai/internal/quality"
 	"github.com/tipmarket/swift-ai/internal/structured"
 )
 
-func TestConvertUsesTrustedNearExactCacheHit(t *testing.T) {
+func TestConvertUsesTrustedExactCacheHitWithoutEmbedding(t *testing.T) {
 	store := &fakeStore{
-		candidates: []cache.Candidate{{
-			Entry: cache.Entry{
-				RawAddress:        "77 RUE DE RIVOLI 75001 PARIS",
-				NormalizedAddress: cascade.NormalizeAddress("77 RUE DE RIVOLI 75001 PARIS"),
-				Structured:        structured.Address{AddressLine: "77 RUE DE RIVOLI 75001 PARIS", Country: "FR", Town: "PARIS"},
-				Source:            cache.SourceCRFPipeline,
+		exact: &cache.Entry{
+			RawAddress:        "77 RUE DE RIVOLI 75001 PARIS",
+			NormalizedAddress: cascade.NormalizeAddress("77 RUE DE RIVOLI 75001 PARIS"),
+			Structured: structured.Address{
+				AddressLine:       "77 RUE DE RIVOLI 75001 PARIS",
+				Country:           "FR",
+				Town:              "PARIS",
+				CountryConfidence: 0.98,
+				TownConfidence:    0.97,
 			},
-			SemanticScore: 0.94,
-		}},
+			Source: cache.SourceCRFPipeline,
+		},
 	}
 	pipeline := &fakePipeline{}
-	service := cascade.NewService(pipeline, cascade.WithCache(store), cascade.WithEmbedder(fakeEmbedder{}))
+	embedder := &fakeEmbedder{}
+	service := cascade.NewService(pipeline, cascade.WithCache(store), cascade.WithEmbedder(embedder))
 
 	got, err := service.Convert(context.Background(), []cascade.Request{{Text: "77 RUE DE RIVOLI 75001 PARIS"}})
 	if err != nil {
@@ -43,11 +48,57 @@ func TestConvertUsesTrustedNearExactCacheHit(t *testing.T) {
 	if got[0].CacheSource != cache.SourceCRFPipeline {
 		t.Fatalf("CacheSource = %q, want %q", got[0].CacheSource, cache.SourceCRFPipeline)
 	}
+	if got[0].SemanticScore != nil {
+		t.Fatalf("SemanticScore = %#v, want nil for exact hit", got[0].SemanticScore)
+	}
+	if got[0].LexicalScore == nil || *got[0].LexicalScore != 1 {
+		t.Fatalf("LexicalScore = %#v, want 1", got[0].LexicalScore)
+	}
+	if embedder.calls != 0 {
+		t.Fatalf("embedder calls = %d, want 0 for exact cache hit", embedder.calls)
+	}
+	if store.searchCalls != 0 {
+		t.Fatalf("semantic search calls = %d, want 0 for exact cache hit", store.searchCalls)
+	}
+	if got[0].ResolutionStatus != quality.StatusResolved || got[0].ConfidenceBand != quality.BandHigh {
+		t.Fatalf("quality = %q/%q, want resolved/high", got[0].ResolutionStatus, got[0].ConfidenceBand)
+	}
+}
+
+func TestConvertUsesTrustedSemanticCacheHitAfterExactMiss(t *testing.T) {
+	store := &fakeStore{
+		candidates: []cache.Candidate{{
+			Entry: cache.Entry{
+				RawAddress:        "77 RUE DE RIVOLI 75001 PARIS",
+				NormalizedAddress: cascade.NormalizeAddress("77 RUE DE RIVOLI 75001 PARIS"),
+				Structured: structured.Address{
+					AddressLine:       "77 RUE DE RIVOLI 75001 PARIS",
+					Country:           "FR",
+					Town:              "PARIS",
+					CountryConfidence: 0.98,
+					TownConfidence:    0.97,
+				},
+				Source: cache.SourceCRFPipeline,
+			},
+			SemanticScore: 0.94,
+		}},
+	}
+	pipeline := &fakePipeline{}
+	service := cascade.NewService(pipeline, cascade.WithCache(store), cascade.WithEmbedder(&fakeEmbedder{}))
+
+	got, err := service.Convert(context.Background(), []cascade.Request{{Text: "77 RUE DE RIVOLI 75001 PARIS"}})
+	if err != nil {
+		t.Fatalf("Convert returned error: %v", err)
+	}
+
+	if pipeline.calls != 0 {
+		t.Fatalf("pipeline calls = %d, want 0", pipeline.calls)
+	}
+	if got[0].ServedBy != cascade.ServedByStage1Cache {
+		t.Fatalf("ServedBy = %q, want %q", got[0].ServedBy, cascade.ServedByStage1Cache)
+	}
 	if got[0].SemanticScore == nil || *got[0].SemanticScore != 0.94 {
 		t.Fatalf("SemanticScore = %#v, want 0.94", got[0].SemanticScore)
-	}
-	if got[0].LexicalScore == nil || *got[0].LexicalScore < 0.85 {
-		t.Fatalf("LexicalScore = %#v, want high lexical score", got[0].LexicalScore)
 	}
 }
 
@@ -66,7 +117,7 @@ func TestConvertFallsBackWhenLexicalGateFailsAndWritesPipelineResult(t *testing.
 	pipeline := &fakePipeline{
 		results: []core.Result{pipelineResult("SAN PO KONG HONG KONG", "HK", "SAN PO KONG")},
 	}
-	service := cascade.NewService(pipeline, cascade.WithCache(store), cascade.WithEmbedder(fakeEmbedder{}))
+	service := cascade.NewService(pipeline, cascade.WithCache(store), cascade.WithEmbedder(&fakeEmbedder{}))
 
 	got, err := service.Convert(context.Background(), []cascade.Request{{Text: "SAN PO KONG HONG KONG"}})
 	if err != nil {
@@ -91,6 +142,9 @@ func TestConvertFallsBackWhenLexicalGateFailsAndWritesPipelineResult(t *testing.
 	if got[0].FallbackReason != cascade.FallbackLexicalGateFailed {
 		t.Fatalf("FallbackReason = %q, want %q", got[0].FallbackReason, cascade.FallbackLexicalGateFailed)
 	}
+	if got[0].ResolutionStatus != quality.StatusNeedsReview || got[0].ConfidenceBand != quality.BandMedium {
+		t.Fatalf("quality = %q/%q, want needs_review/medium", got[0].ResolutionStatus, got[0].ConfidenceBand)
+	}
 	if len(pipeline.samples) != 1 || pipeline.samples[0].HasSuggestedCountry || pipeline.samples[0].ForceSuggestedCountry {
 		t.Fatalf("pipeline sample = %#v, want text-only sample without country hints", pipeline.samples)
 	}
@@ -111,7 +165,7 @@ func TestConvertFallsBackForSonnetSeedByDefault(t *testing.T) {
 	pipeline := &fakePipeline{
 		results: []core.Result{pipelineResult("350 FIFTH AVENUE NEW YORK NY 10118", "US", "NEW YORK")},
 	}
-	service := cascade.NewService(pipeline, cascade.WithCache(store), cascade.WithEmbedder(fakeEmbedder{}))
+	service := cascade.NewService(pipeline, cascade.WithCache(store), cascade.WithEmbedder(&fakeEmbedder{}))
 
 	got, err := service.Convert(context.Background(), []cascade.Request{{Text: "350 FIFTH AVENUE NEW YORK NY 10118"}})
 	if err != nil {
@@ -146,7 +200,7 @@ func TestConvertBatchPreservesOrderAcrossCacheAndPipeline(t *testing.T) {
 			pipelineResult("ACME GMBH 10115 BERLIN", "DE", "BERLIN"),
 		},
 	}
-	service := cascade.NewService(pipeline, cascade.WithCache(store), cascade.WithEmbedder(fakeEmbedder{}))
+	service := cascade.NewService(pipeline, cascade.WithCache(store), cascade.WithEmbedder(&fakeEmbedder{}))
 
 	got, err := service.Convert(context.Background(), []cascade.Request{
 		{Text: "350 FIFTH AVENUE NEW YORK NY 10118"},
@@ -181,19 +235,32 @@ func TestConvertReturnsPipelineError(t *testing.T) {
 	}
 }
 
-type fakeEmbedder struct{}
-
-func (fakeEmbedder) Embed(_ context.Context, text string) ([]float64, error) {
+func (e *fakeEmbedder) Embed(_ context.Context, text string) ([]float64, error) {
+	e.calls++
 	return []float64{float64(len(text))}, nil
+}
+
+type fakeEmbedder struct {
+	calls int
 }
 
 type fakeStore struct {
 	candidates       []cache.Candidate
 	candidatesByText map[string][]cache.Candidate
 	upserts          []cache.Entry
+	exact            *cache.Entry
+	searchCalls      int
+}
+
+func (s *fakeStore) LookupNormalized(_ context.Context, _ string) (cache.Entry, bool, error) {
+	if s.exact == nil {
+		return cache.Entry{}, false, nil
+	}
+	return *s.exact, true, nil
 }
 
 func (s *fakeStore) Search(_ context.Context, normalizedAddress string, _ []float64, _ int) ([]cache.Candidate, error) {
+	s.searchCalls++
 	if s.candidatesByText != nil {
 		return s.candidatesByText[normalizedAddress], nil
 	}

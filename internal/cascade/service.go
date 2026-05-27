@@ -7,6 +7,7 @@ import (
 
 	"github.com/tipmarket/swift-ai/internal/cache"
 	"github.com/tipmarket/swift-ai/internal/core"
+	"github.com/tipmarket/swift-ai/internal/quality"
 	"github.com/tipmarket/swift-ai/internal/structured"
 )
 
@@ -32,13 +33,15 @@ type Request struct {
 }
 
 type Item struct {
-	Input          string             `json:"input"`
-	Structured     structured.Address `json:"structured"`
-	ServedBy       ServedBy           `json:"served_by"`
-	CacheSource    cache.Source       `json:"cache_source,omitempty"`
-	SemanticScore  *float64           `json:"semantic_score,omitempty"`
-	LexicalScore   *float64           `json:"lexical_score,omitempty"`
-	FallbackReason string             `json:"fallback_reason,omitempty"`
+	Input            string             `json:"input"`
+	Structured       structured.Address `json:"structured"`
+	ServedBy         ServedBy           `json:"served_by"`
+	CacheSource      cache.Source       `json:"cache_source,omitempty"`
+	ResolutionStatus quality.Status     `json:"resolution_status"`
+	ConfidenceBand   quality.Band       `json:"confidence_band"`
+	SemanticScore    *float64           `json:"semantic_score,omitempty"`
+	LexicalScore     *float64           `json:"lexical_score,omitempty"`
+	FallbackReason   string             `json:"fallback_reason,omitempty"`
 }
 
 type Pipeline interface {
@@ -55,6 +58,7 @@ type Config struct {
 	SearchLimit       int
 	TrustSonnetSeed   bool
 	TrustLLMAssisted  bool
+	QualityThresholds quality.Thresholds
 }
 
 type Option func(*Service)
@@ -71,6 +75,7 @@ func DefaultConfig() Config {
 		SemanticThreshold: 0.90,
 		LexicalThreshold:  0.85,
 		SearchLimit:       5,
+		QualityThresholds: quality.DefaultThresholds(),
 	}
 }
 
@@ -110,6 +115,9 @@ func WithConfig(cfg Config) Option {
 		}
 		s.cfg.TrustSonnetSeed = cfg.TrustSonnetSeed
 		s.cfg.TrustLLMAssisted = cfg.TrustLLMAssisted
+		if cfg.QualityThresholds.High > 0 || cfg.QualityThresholds.Medium > 0 {
+			s.cfg.QualityThresholds = cfg.QualityThresholds
+		}
 	}
 }
 
@@ -165,6 +173,7 @@ func (s *Service) Convert(ctx context.Context, requests []Request) ([]Item, erro
 			LexicalScore:   miss.lexicalScore,
 			FallbackReason: miss.reason,
 		}
+		applyQuality(&items[miss.index], s.cfg.QualityThresholds)
 
 		if s.cache != nil && len(miss.embedding) > 0 {
 			_ = s.cache.Upsert(ctx, cache.Entry{
@@ -181,14 +190,40 @@ func (s *Service) Convert(ctx context.Context, requests []Request) ([]Item, erro
 }
 
 func (s *Service) tryStage1(ctx context.Context, index int, request Request, normalized string) (Item, *miss) {
-	if s.cache == nil || s.embedder == nil {
+	if s.cache == nil {
 		return Item{}, &miss{index: index, request: request, normalized: normalized, reason: FallbackStage1Unconfigured}
 	}
 
+	fallback := miss{index: index, request: request, normalized: normalized, reason: FallbackCacheMiss}
+	entry, ok, err := s.cache.LookupNormalized(ctx, normalized)
+	if err != nil {
+		return Item{}, &miss{index: index, request: request, normalized: normalized, reason: FallbackCacheError}
+	}
+	if ok {
+		lexical := 1.0
+		fallback.lexicalScore = &lexical
+		if s.trusted(entry.Source) {
+			item := Item{
+				Input:        request.Text,
+				Structured:   entry.Structured,
+				ServedBy:     ServedByStage1Cache,
+				CacheSource:  entry.Source,
+				LexicalScore: &lexical,
+			}
+			applyQuality(&item, s.cfg.QualityThresholds)
+			return item, nil
+		}
+		fallback.reason = FallbackUntrustedCacheSource
+	}
+
+	if s.embedder == nil {
+		return Item{}, &fallback
+	}
 	embedding, err := s.embedder.Embed(ctx, normalized)
 	if err != nil {
 		return Item{}, &miss{index: index, request: request, normalized: normalized, reason: FallbackEmbeddingError}
 	}
+	fallback.embedding = embedding
 	candidates, err := s.cache.Search(ctx, normalized, embedding, s.cfg.SearchLimit)
 	if err != nil {
 		return Item{}, &miss{index: index, request: request, normalized: normalized, embedding: embedding, reason: FallbackCacheError}
@@ -197,7 +232,6 @@ func (s *Service) tryStage1(ctx context.Context, index int, request Request, nor
 		return Item{}, &miss{index: index, request: request, normalized: normalized, embedding: embedding, reason: FallbackCacheMiss}
 	}
 
-	fallback := miss{index: index, request: request, normalized: normalized, embedding: embedding, reason: FallbackCacheMiss}
 	for _, candidate := range candidates {
 		semantic := candidate.SemanticScore
 		lexical := LexicalIdentity(normalized, candidate.Entry.NormalizedAddress)
@@ -217,17 +251,25 @@ func (s *Service) tryStage1(ctx context.Context, index int, request Request, nor
 			continue
 		}
 
-		return Item{
+		item := Item{
 			Input:         request.Text,
 			Structured:    candidate.Entry.Structured,
 			ServedBy:      ServedByStage1Cache,
 			CacheSource:   candidate.Entry.Source,
 			SemanticScore: &semantic,
 			LexicalScore:  &lexical,
-		}, nil
+		}
+		applyQuality(&item, s.cfg.QualityThresholds)
+		return item, nil
 	}
 
 	return Item{}, &fallback
+}
+
+func applyQuality(item *Item, thresholds quality.Thresholds) {
+	assessment := quality.Assess(item.Structured, thresholds)
+	item.ResolutionStatus = assessment.Status
+	item.ConfidenceBand = assessment.Band
 }
 
 func (s *Service) trusted(source cache.Source) bool {
