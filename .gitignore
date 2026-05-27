@@ -8,3 +8,7 @@ bin/
 # Python tooling artifacts
 __pycache__/
 *.pyc
+
+# Downloaded/generated model and reference data
+resources/
+.onnxruntime/

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -171,6 +172,20 @@ func TestReviewFileWriterStreamsJSONArray(t *testing.T) {
 	}
 	if len(rows) != 2 || rows[0].Input != "a" || rows[1].Input != "b" {
 		t.Fatalf("rows = %#v, want two streamed review rows", rows)
+	}
+}
+
+func TestParseArgsAllowsLocalEmbeddingEndpointWithoutAPIKey(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "")
+
+	_, err := parseArgs([]string{
+		"--input-path", "addresses.csv",
+		"--database-url", "postgresql://postgres:postgres@127.0.0.1:5432/swift_ai",
+		"--embedding-base-url", "http://127.0.0.1:8090",
+		"--embedding-model", "sentence-transformers/all-MiniLM-L6-v2",
+	}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseArgs() error = %v, want local embedding endpoint without API key", err)
 	}
 }
 

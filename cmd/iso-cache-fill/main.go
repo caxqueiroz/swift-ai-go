@@ -39,6 +39,10 @@ type fillOptions struct {
 	embeddingBaseURL          string
 	embeddingModel            string
 	embeddingDimensions       int
+	embeddingBackend          string
+	embeddingModelPath        string
+	embeddingVocabPath        string
+	embeddingMaxSequenceLen   int
 	enableLLMJudge            bool
 	judgeAPIKey               string
 	judgeBaseURL              string
@@ -102,16 +106,17 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		}
 	}()
 
-	var store *cache.PostgresStore
-	var embedder *embedding.OpenAICompatible
+	var store cacheWriter
+	var embedder cacheEmbedder
 	var adjudicator judgepkg.Client
 	if !opts.dryRun {
-		store, embedder, err = fillDependencies(ctx, opts)
+		var closeFill func()
+		store, embedder, closeFill, err = fillDependencies(ctx, opts)
 		if err != nil {
 			logger.Error("configure cache fill", "error", err)
 			return 1
 		}
-		defer store.Close()
+		defer closeFill()
 	}
 	if opts.enableLLMJudge {
 		adjudicator, err = judgeDependency(opts)
@@ -163,6 +168,10 @@ func parseArgs(args []string, stderr io.Writer) (fillOptions, error) {
 		embeddingAPIKey:           os.Getenv("OPENAI_API_KEY"),
 		embeddingBaseURL:          envDefault("OPENAI_BASE_URL", "https://api.openai.com/v1"),
 		embeddingModel:            os.Getenv("EMBEDDING_MODEL"),
+		embeddingBackend:          envDefault("EMBEDDING_BACKEND", "openai"),
+		embeddingModelPath:        envDefault("EMBEDDING_MODEL_PATH", embedding.DefaultLocalModelPath),
+		embeddingVocabPath:        envDefault("EMBEDDING_VOCAB_PATH", embedding.DefaultLocalVocabPath),
+		embeddingMaxSequenceLen:   embedding.DefaultLocalMaxSequenceLength,
 		judgeAPIKey:               envDefault("JUDGE_API_KEY", os.Getenv("OPENAI_API_KEY")),
 		judgeBaseURL:              envDefault("JUDGE_BASE_URL", envDefault("OPENAI_BASE_URL", "https://api.openai.com/v1")),
 		judgeModel:                os.Getenv("JUDGE_MODEL"),
@@ -180,6 +189,13 @@ func parseArgs(args []string, stderr io.Writer) (fillOptions, error) {
 		}
 		opts.embeddingDimensions = dimensions
 	}
+	if value := os.Getenv("EMBEDDING_MAX_SEQUENCE_LENGTH"); value != "" {
+		maxSequenceLength, err := strconv.Atoi(value)
+		if err != nil {
+			return fillOptions{}, fmt.Errorf("parse EMBEDDING_MAX_SEQUENCE_LENGTH: %w", err)
+		}
+		opts.embeddingMaxSequenceLen = maxSequenceLength
+	}
 
 	fs := flag.NewFlagSet("iso-cache-fill", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -193,6 +209,10 @@ func parseArgs(args []string, stderr io.Writer) (fillOptions, error) {
 	fs.StringVar(&opts.embeddingBaseURL, "embedding-base-url", opts.embeddingBaseURL, "OpenAI-compatible base URL")
 	fs.StringVar(&opts.embeddingModel, "embedding-model", opts.embeddingModel, "embedding model name")
 	fs.IntVar(&opts.embeddingDimensions, "embedding-dimensions", opts.embeddingDimensions, "optional embedding dimensions")
+	fs.StringVar(&opts.embeddingBackend, "embedding-backend", opts.embeddingBackend, "embedding backend: openai or onnx")
+	fs.StringVar(&opts.embeddingModelPath, "embedding-model-path", opts.embeddingModelPath, "local ONNX embedding model path")
+	fs.StringVar(&opts.embeddingVocabPath, "embedding-vocab-path", opts.embeddingVocabPath, "local embedding vocab.txt path")
+	fs.IntVar(&opts.embeddingMaxSequenceLen, "embedding-max-sequence-length", opts.embeddingMaxSequenceLen, "local embedding max sequence length")
 	fs.BoolVar(&opts.enableLLMJudge, "enable-llm-judge", opts.enableLLMJudge, "use constrained LLM judge for non-high-confidence rows")
 	fs.StringVar(&opts.judgeAPIKey, "judge-api-key", opts.judgeAPIKey, "OpenAI-compatible judge API key")
 	fs.StringVar(&opts.judgeBaseURL, "judge-base-url", opts.judgeBaseURL, "OpenAI-compatible judge base URL")
@@ -215,10 +235,7 @@ func parseArgs(args []string, stderr io.Writer) (fillOptions, error) {
 		if opts.databaseURL == "" {
 			return fillOptions{}, errors.New("database URL is required unless --dry-run is set")
 		}
-		if opts.embeddingAPIKey == "" {
-			return fillOptions{}, errors.New("embedding API key is required unless --dry-run is set")
-		}
-		if opts.embeddingModel == "" {
+		if (opts.embeddingBackend == "openai" || opts.embeddingBackend == "http") && opts.embeddingModel == "" {
 			return fillOptions{}, errors.New("embedding model is required unless --dry-run is set")
 		}
 	}
@@ -496,22 +513,44 @@ func readSamples(path string) ([]core.AddressSample, error) {
 	}
 }
 
-func fillDependencies(ctx context.Context, opts fillOptions) (*cache.PostgresStore, *embedding.OpenAICompatible, error) {
+func fillDependencies(ctx context.Context, opts fillOptions) (cacheWriter, cacheEmbedder, func(), error) {
 	store, err := cache.NewPostgresStore(ctx, opts.databaseURL)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, func() {}, err
 	}
-	embedder, err := embedding.NewOpenAICompatible(embedding.Config{
-		APIKey:     opts.embeddingAPIKey,
-		BaseURL:    opts.embeddingBaseURL,
-		Model:      opts.embeddingModel,
-		Dimensions: opts.embeddingDimensions,
-	})
-	if err != nil {
+	switch opts.embeddingBackend {
+	case "openai", "http":
+		embedder, err := embedding.NewOpenAICompatible(embedding.Config{
+			APIKey:     opts.embeddingAPIKey,
+			BaseURL:    opts.embeddingBaseURL,
+			Model:      opts.embeddingModel,
+			Dimensions: opts.embeddingDimensions,
+		})
+		if err != nil {
+			store.Close()
+			return nil, nil, func() {}, err
+		}
+		return store, embedder, store.Close, nil
+	case "onnx", "local":
+		embedder, err := embedding.NewLocalONNX(embedding.LocalConfig{
+			ModelPath:         opts.embeddingModelPath,
+			VocabPath:         opts.embeddingVocabPath,
+			SharedLibraryPath: os.Getenv("ISO20022_ONNX_RUNTIME"),
+			MaxSequenceLength: opts.embeddingMaxSequenceLen,
+		})
+		if err != nil {
+			store.Close()
+			return nil, nil, func() {}, err
+		}
+		closeAll := func() {
+			_ = embedder.Close()
+			store.Close()
+		}
+		return store, embedder, closeAll, nil
+	default:
 		store.Close()
-		return nil, nil, err
+		return nil, nil, func() {}, fmt.Errorf("unsupported embedding backend %q", opts.embeddingBackend)
 	}
-	return store, embedder, nil
 }
 
 func judgeDependency(opts fillOptions) (judgepkg.Client, error) {

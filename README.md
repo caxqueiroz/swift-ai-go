@@ -24,7 +24,7 @@ The upstream resource files and trained model weights are not vendored here. You
 | `internal/api` | JSON request/response handling. |
 | `internal/cascade` | Stage 1 cache gate, Stage 2 fallback, provenance policy, write-back. |
 | `internal/cache` | Postgres/pgvector cache implementation. |
-| `internal/embedding` | OpenAI-compatible embedding client. |
+| `internal/embedding` | In-process MiniLM ONNX embeddings and OpenAI-compatible embedding client. |
 | `internal/structured` | Stable API/cache structured address output. |
 | `internal/pipeline` | End-to-end CRF + fuzzy + postcode + postprocess orchestration. |
 | `internal/model` | Character tokenizer, ONNX adapter, CRF decoding, span grouping. |
@@ -41,9 +41,16 @@ The upstream resource files and trained model weights are not vendored here. You
 - Upstream ISO20022 resource directory
 - Converted model files under `resources/models`
 - Optional for Stage 1: Postgres with `pgvector`
-- Optional for Stage 1: OpenAI-compatible embedding endpoint
+- Optional for Stage 1: local MiniLM ONNX embedding artifacts, or an OpenAI-compatible embedding endpoint
 
 `internal/model` uses `github.com/yalue/onnxruntime_go`. For real inference, install ONNX Runtime and set `ISO20022_ONNX_RUNTIME` if the shared library is not discoverable by default.
+
+For macOS arm64, the Taskfile can download the official ONNX Runtime release pinned by this project:
+
+```bash
+task onnxruntime:download-darwin-arm64
+export ISO20022_ONNX_RUNTIME="$PWD/.onnxruntime/onnxruntime-osx-arm64-1.26.0/lib/libonnxruntime.1.26.0.dylib"
+```
 
 ## Commands
 
@@ -54,6 +61,8 @@ task verify        # tests + lint
 task build         # build iso-run, iso-api, and iso-cache-fill
 task build-api     # build only iso-api
 task build-cache-fill
+task embeddings:download-minilm
+task onnxruntime:download-darwin-arm64
 ```
 
 Equivalent Make targets are available:
@@ -101,6 +110,21 @@ Output supports `.csv`, `.tsv`, and `.json`. Pass `--verbose` to include CRF emi
 
 `POST /convert` accepts free text only. Do not send `suggested_country` or `force_suggested_country`; country and town are resolved by trusted cache or the Swift/CRF + GeoNames pipeline.
 
+With in-process CPU MiniLM embeddings:
+
+```bash
+task embeddings:download-minilm
+task onnxruntime:download-darwin-arm64
+
+ISO20022_ONNX_RUNTIME=$PWD/.onnxruntime/onnxruntime-osx-arm64-1.26.0/lib/libonnxruntime.1.26.0.dylib \
+ISO20022_RESOURCES_DIR=/path/to/upstream/resources \
+DATABASE_URL=postgres://user:pass@localhost:5432/swift_ai?sslmode=disable \
+EMBEDDING_BACKEND=onnx \
+go run ./cmd/iso-api --model-dir resources/models
+```
+
+With an OpenAI-compatible embedding endpoint:
+
 ```bash
 ISO20022_ONNX_RUNTIME=/path/to/libonnxruntime.so \
 ISO20022_RESOURCES_DIR=/path/to/upstream/resources \
@@ -110,7 +134,7 @@ EMBEDDING_MODEL=text-embedding-model \
 go run ./cmd/iso-api --model-dir resources/models
 ```
 
-If `DATABASE_URL`, `OPENAI_API_KEY`, or `EMBEDDING_MODEL` is missing, the API still works through live Swift/CRF + GeoNames inference and disables semantic cache lookup.
+If `DATABASE_URL` is missing, the API still works through live Swift/CRF + GeoNames inference and disables semantic cache lookup. For `EMBEDDING_BACKEND=openai`, `EMBEDDING_MODEL` is also required. For `EMBEDDING_BACKEND=onnx`, the process loads `resources/embeddings/all-MiniLM-L6-v2/model.onnx` and `vocab.txt`.
 
 ### Single Request
 
@@ -213,10 +237,14 @@ Any miss, low lexical score, low semantic score, untrusted source, embedding err
 | `ISO20022_ONNX_RUNTIME` | Yes for inference | Path to ONNX Runtime shared library when not discoverable. |
 | `ISO20022_RESOURCES_DIR` | Yes for inference | Upstream resources directory. |
 | `DATABASE_URL` | Stage 1 only | Postgres connection string for semantic cache. |
-| `OPENAI_API_KEY` | Stage 1 only | API key for OpenAI-compatible embeddings. |
+| `EMBEDDING_BACKEND` | Stage 1 only | `onnx` for in-process MiniLM, or `openai` for HTTP embeddings. Defaults to `openai`. |
+| `EMBEDDING_MODEL_PATH` | ONNX Stage 1 only | Local embedding ONNX path. Defaults to `resources/embeddings/all-MiniLM-L6-v2/model.onnx`. |
+| `EMBEDDING_VOCAB_PATH` | ONNX Stage 1 only | Local WordPiece vocab path. Defaults to `resources/embeddings/all-MiniLM-L6-v2/vocab.txt`. |
+| `EMBEDDING_MAX_SEQUENCE_LENGTH` | No | Local embedding max sequence length. Defaults to `256`. |
+| `OPENAI_API_KEY` | HTTP Stage 1 only | Optional API key for OpenAI-compatible embeddings. Not needed for local ONNX. |
 | `OPENAI_BASE_URL` | No | Embedding API base URL. Defaults to `https://api.openai.com/v1`. |
-| `EMBEDDING_MODEL` | Stage 1 only | Embedding model name. |
-| `EMBEDDING_DIMENSIONS` | No | Optional embedding dimensions. |
+| `EMBEDDING_MODEL` | HTTP Stage 1 only | Embedding model name for `EMBEDDING_BACKEND=openai`. |
+| `EMBEDDING_DIMENSIONS` | No | Optional HTTP embedding dimensions. |
 | `JUDGE_API_KEY` | Cache fill only | API key for offline LLM judge. Defaults to `OPENAI_API_KEY`. |
 | `JUDGE_BASE_URL` | Cache fill only | Judge API base URL. Defaults to `OPENAI_BASE_URL`. |
 | `JUDGE_MODEL` | Cache fill only | LLM judge model name. |
@@ -242,8 +270,8 @@ The migration creates:
 The vector column is intentionally dimension-agnostic because embedding dimensions depend on the chosen embedding model. After you standardize on a model/dimension, add a dimension-specific vector index, for example:
 
 ```sql
-CREATE INDEX address_cache_embedding_cos_1536_idx
-    ON address_cache USING ivfflat ((embedding::vector(1536)) vector_cosine_ops) WITH (lists = 100);
+CREATE INDEX address_cache_embedding_cos_384_idx
+    ON address_cache USING ivfflat ((embedding::vector(384)) vector_cosine_ops) WITH (lists = 100);
 ```
 
 ### Local pg0 Database
@@ -264,6 +292,24 @@ postgresql://postgres:postgres@127.0.0.1:5432/swift_ai
 ## Fill The Semantic Cache
 
 Use `iso-cache-fill` to run the Swift/CRF + GeoNames pipeline over a corpus and write high-confidence outputs into `address_cache` as `crf_pipeline`. Rows below the high threshold can be sent to an offline LLM judge.
+
+With local ONNX embeddings:
+
+```bash
+task embeddings:download-minilm
+task onnxruntime:download-darwin-arm64
+
+ISO20022_ONNX_RUNTIME=$PWD/.onnxruntime/onnxruntime-osx-arm64-1.26.0/lib/libonnxruntime.1.26.0.dylib \
+go run ./cmd/iso-cache-fill \
+  --embedding-backend onnx \
+  --input-path testdata/parity/addresses.csv \
+  --resources-dir /path/to/upstream/resources \
+  --model-dir resources/models \
+  --database-url "$DATABASE_URL" \
+  --review-path /tmp/address-review.json
+```
+
+With an OpenAI-compatible embedding endpoint:
 
 ```bash
 ISO20022_ONNX_RUNTIME=/path/to/libonnxruntime.so \
@@ -287,6 +333,9 @@ Useful flags:
 |------|---------|
 | `--dry-run` | Run Stage 2 and review export without writing cache. |
 | `--input-path` | Input file or OpenAddresses/DataAddr directory. Files support `.txt`, `.csv`, `.tsv`, and `.geojson`; directories are scanned for `*addresses*.geojson`. |
+| `--embedding-backend` | `onnx` for in-process MiniLM embeddings, or `openai` for HTTP embeddings. |
+| `--embedding-model-path` | Local ONNX embedding model path for `--embedding-backend onnx`. |
+| `--embedding-vocab-path` | Local WordPiece vocab path for `--embedding-backend onnx`. |
 | `--country` | Optional ISO alpha-2 country folder filter for DataAddr directory input, e.g. `SG` or `US`. |
 | `--max-records` | Stop after N extracted input records. Use this for smoke tests before full corpus runs. |
 | `--high-confidence-threshold` | Minimum country/town confidence for direct `crf_pipeline` cache writes. Default `0.95`. |
@@ -315,16 +364,15 @@ The mounted address corpus is OpenAddresses-style newline-delimited GeoJSON. In 
 /Volumes/cax-t7/Data/DataAddr
 ```
 
+Pass `DATAADDR_DIR=/Volumes/cax-i7/Data/DataAddr` if that is where the corpus is mounted on your machine.
+
 Run a small smoke fill first:
 
 ```bash
 task pg0:start
 task pg0:migrate
 
-ISO20022_ONNX_RUNTIME=/path/to/libonnxruntime.dylib \
-OPENAI_API_KEY=$OPENAI_API_KEY \
-EMBEDDING_MODEL=text-embedding-model \
-task cache-fill:dataaddr COUNTRY=SG MAX_RECORDS=100 \
+task cache-fill:dataaddr-local COUNTRY=SG MAX_RECORDS=100 \
   RESOURCES_DIR=/path/to/upstream/resources \
   MODEL_DIR=resources/models \
   REVIEW_PATH=/tmp/address-review-sg.json
@@ -333,10 +381,7 @@ task cache-fill:dataaddr COUNTRY=SG MAX_RECORDS=100 \
 Then remove `MAX_RECORDS` to process the selected country, or remove `COUNTRY` to scan the whole corpus:
 
 ```bash
-ISO20022_ONNX_RUNTIME=/path/to/libonnxruntime.dylib \
-OPENAI_API_KEY=$OPENAI_API_KEY \
-EMBEDDING_MODEL=text-embedding-model \
-task cache-fill:dataaddr COUNTRY=SG \
+task cache-fill:dataaddr-local COUNTRY=SG \
   RESOURCES_DIR=/path/to/upstream/resources \
   MODEL_DIR=resources/models \
   REVIEW_PATH=/tmp/address-review-sg.json

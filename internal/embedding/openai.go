@@ -29,9 +29,6 @@ type OpenAICompatible struct {
 }
 
 func NewOpenAICompatible(cfg Config) (*OpenAICompatible, error) {
-	if strings.TrimSpace(cfg.APIKey) == "" {
-		return nil, errors.New("api key is required")
-	}
 	if strings.TrimSpace(cfg.Model) == "" {
 		return nil, errors.New("embedding model is required")
 	}
@@ -71,11 +68,13 @@ func (c *OpenAICompatible) Embed(ctx context.Context, text string) ([]float64, e
 		return nil, fmt.Errorf("encode embedding request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/embeddings", bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, embeddingEndpoint(c.baseURL), bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("create embedding request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.client.Do(req)
@@ -98,6 +97,13 @@ func (c *OpenAICompatible) Embed(ctx context.Context, text string) ([]float64, e
 		return nil, errors.New("embedding response did not contain an embedding")
 	}
 	return payload.Data[0].Embedding, nil
+}
+
+func embeddingEndpoint(baseURL string) string {
+	if strings.HasSuffix(baseURL, "/v1") {
+		return baseURL + "/embeddings"
+	}
+	return baseURL + "/v1/embeddings"
 }
 
 type embeddingRequest struct {

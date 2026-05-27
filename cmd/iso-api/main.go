@@ -32,6 +32,10 @@ type options struct {
 	embeddingBaseURL          string
 	embeddingModel            string
 	embeddingDimensions       int
+	embeddingBackend          string
+	embeddingModelPath        string
+	embeddingVocabPath        string
+	embeddingMaxSequenceLen   int
 	batchSize                 int
 	semanticThreshold         float64
 	lexicalThreshold          float64
@@ -137,6 +141,10 @@ func parseArgs(args []string, stderr io.Writer) (options, error) {
 		embeddingAPIKey:           os.Getenv("OPENAI_API_KEY"),
 		embeddingBaseURL:          envDefault("OPENAI_BASE_URL", "https://api.openai.com/v1"),
 		embeddingModel:            os.Getenv("EMBEDDING_MODEL"),
+		embeddingBackend:          envDefault("EMBEDDING_BACKEND", "openai"),
+		embeddingModelPath:        envDefault("EMBEDDING_MODEL_PATH", embedding.DefaultLocalModelPath),
+		embeddingVocabPath:        envDefault("EMBEDDING_VOCAB_PATH", embedding.DefaultLocalVocabPath),
+		embeddingMaxSequenceLen:   embedding.DefaultLocalMaxSequenceLength,
 		batchSize:                 cfg.BatchSize,
 		semanticThreshold:         0.90,
 		lexicalThreshold:          0.85,
@@ -150,6 +158,13 @@ func parseArgs(args []string, stderr io.Writer) (options, error) {
 		}
 		opts.embeddingDimensions = dimensions
 	}
+	if value := os.Getenv("EMBEDDING_MAX_SEQUENCE_LENGTH"); value != "" {
+		maxSequenceLength, err := strconv.Atoi(value)
+		if err != nil {
+			return options{}, fmt.Errorf("parse EMBEDDING_MAX_SEQUENCE_LENGTH: %w", err)
+		}
+		opts.embeddingMaxSequenceLen = maxSequenceLength
+	}
 
 	fs := flag.NewFlagSet("iso-api", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -162,6 +177,10 @@ func parseArgs(args []string, stderr io.Writer) (options, error) {
 	fs.StringVar(&opts.embeddingBaseURL, "embedding-base-url", opts.embeddingBaseURL, "OpenAI-compatible base URL")
 	fs.StringVar(&opts.embeddingModel, "embedding-model", opts.embeddingModel, "embedding model name")
 	fs.IntVar(&opts.embeddingDimensions, "embedding-dimensions", opts.embeddingDimensions, "optional embedding dimensions")
+	fs.StringVar(&opts.embeddingBackend, "embedding-backend", opts.embeddingBackend, "embedding backend: openai or onnx")
+	fs.StringVar(&opts.embeddingModelPath, "embedding-model-path", opts.embeddingModelPath, "local ONNX embedding model path")
+	fs.StringVar(&opts.embeddingVocabPath, "embedding-vocab-path", opts.embeddingVocabPath, "local embedding vocab.txt path")
+	fs.IntVar(&opts.embeddingMaxSequenceLen, "embedding-max-sequence-length", opts.embeddingMaxSequenceLen, "local embedding max sequence length")
 	fs.Float64Var(&opts.semanticThreshold, "semantic-threshold", opts.semanticThreshold, "minimum cosine similarity for Stage 1")
 	fs.Float64Var(&opts.lexicalThreshold, "lexical-threshold", opts.lexicalThreshold, "minimum lexical identity for Stage 1")
 	fs.Float64Var(&opts.highConfidenceThreshold, "high-confidence-threshold", opts.highConfidenceThreshold, "minimum country/town confidence for resolved status")
@@ -175,24 +194,50 @@ func parseArgs(args []string, stderr io.Writer) (options, error) {
 }
 
 func stage1Dependencies(ctx context.Context, opts options) (cache.Store, cascade.Embedder, func(), error) {
-	if opts.databaseURL == "" || opts.embeddingAPIKey == "" || opts.embeddingModel == "" {
+	if opts.databaseURL == "" {
 		return nil, nil, func() {}, nil
 	}
 	store, err := cache.NewPostgresStore(ctx, opts.databaseURL)
 	if err != nil {
 		return nil, nil, func() {}, err
 	}
-	embedder, err := embedding.NewOpenAICompatible(embedding.Config{
-		APIKey:     opts.embeddingAPIKey,
-		BaseURL:    opts.embeddingBaseURL,
-		Model:      opts.embeddingModel,
-		Dimensions: opts.embeddingDimensions,
-	})
-	if err != nil {
+	switch opts.embeddingBackend {
+	case "openai", "http":
+		if opts.embeddingModel == "" {
+			store.Close()
+			return nil, nil, func() {}, errors.New("embedding model is required for openai embedding backend")
+		}
+		embedder, err := embedding.NewOpenAICompatible(embedding.Config{
+			APIKey:     opts.embeddingAPIKey,
+			BaseURL:    opts.embeddingBaseURL,
+			Model:      opts.embeddingModel,
+			Dimensions: opts.embeddingDimensions,
+		})
+		if err != nil {
+			store.Close()
+			return nil, nil, func() {}, err
+		}
+		return store, embedder, store.Close, nil
+	case "onnx", "local":
+		embedder, err := embedding.NewLocalONNX(embedding.LocalConfig{
+			ModelPath:         opts.embeddingModelPath,
+			VocabPath:         opts.embeddingVocabPath,
+			SharedLibraryPath: os.Getenv("ISO20022_ONNX_RUNTIME"),
+			MaxSequenceLength: opts.embeddingMaxSequenceLen,
+		})
+		if err != nil {
+			store.Close()
+			return nil, nil, func() {}, err
+		}
+		closeAll := func() {
+			_ = embedder.Close()
+			store.Close()
+		}
+		return store, embedder, closeAll, nil
+	default:
 		store.Close()
-		return nil, nil, func() {}, err
+		return nil, nil, func() {}, fmt.Errorf("unsupported embedding backend %q", opts.embeddingBackend)
 	}
-	return store, embedder, store.Close, nil
 }
 
 func defaultAddr() string {

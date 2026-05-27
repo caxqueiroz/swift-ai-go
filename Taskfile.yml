@@ -6,6 +6,7 @@ vars:
   API_BIN_NAME: iso-api
   CACHE_FILL_BIN_NAME: iso-cache-fill
   GO_CACHE: /private/tmp/swift-ai-go-build
+  GO_MOD_CACHE: /private/tmp/swift-ai-go-mod
   GOLANGCI_LINT_CACHE: /private/tmp/swift-ai-golangci-lint
   PG0_NAME: swift-ai-cache
   PG0_DATABASE: swift_ai
@@ -13,6 +14,10 @@ vars:
   PG0_PASSWORD: postgres
   PG0_DATA_DIR: /private/tmp/swift-ai-pg0/data
   PG0_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/swift_ai
+  MINILM_DIR: resources/embeddings/all-MiniLM-L6-v2
+  ONNXRUNTIME_VERSION: 1.26.0
+  ONNXRUNTIME_OSX_ARM64_DIR: .onnxruntime/onnxruntime-osx-arm64-{{.ONNXRUNTIME_VERSION}}
+  ONNXRUNTIME_OSX_ARM64_LIB: '{{.ONNXRUNTIME_OSX_ARM64_DIR}}/lib/libonnxruntime.{{.ONNXRUNTIME_VERSION}}.dylib'
 
 tasks:
   default:
@@ -24,27 +29,46 @@ tasks:
   test:
     desc: Run all Go tests
     cmds:
-      - env GOCACHE={{.GO_CACHE}} go test ./...
+      - env GOCACHE={{.GO_CACHE}} GOMODCACHE={{.GO_MOD_CACHE}} go test ./...
 
   build:
     desc: Build all binaries
     cmds:
       - mkdir -p {{.BIN_DIR}}
-      - env GOCACHE={{.GO_CACHE}} go build -o {{.BIN_DIR}}/{{.BIN_NAME}} ./cmd/iso-run
-      - env GOCACHE={{.GO_CACHE}} go build -o {{.BIN_DIR}}/{{.API_BIN_NAME}} ./cmd/iso-api
-      - env GOCACHE={{.GO_CACHE}} go build -o {{.BIN_DIR}}/{{.CACHE_FILL_BIN_NAME}} ./cmd/iso-cache-fill
+      - env GOCACHE={{.GO_CACHE}} GOMODCACHE={{.GO_MOD_CACHE}} go build -o {{.BIN_DIR}}/{{.BIN_NAME}} ./cmd/iso-run
+      - env GOCACHE={{.GO_CACHE}} GOMODCACHE={{.GO_MOD_CACHE}} go build -o {{.BIN_DIR}}/{{.API_BIN_NAME}} ./cmd/iso-api
+      - env GOCACHE={{.GO_CACHE}} GOMODCACHE={{.GO_MOD_CACHE}} go build -o {{.BIN_DIR}}/{{.CACHE_FILL_BIN_NAME}} ./cmd/iso-cache-fill
 
   build-api:
     desc: Build the iso-api server
     cmds:
       - mkdir -p {{.BIN_DIR}}
-      - env GOCACHE={{.GO_CACHE}} go build -o {{.BIN_DIR}}/{{.API_BIN_NAME}} ./cmd/iso-api
+      - env GOCACHE={{.GO_CACHE}} GOMODCACHE={{.GO_MOD_CACHE}} go build -o {{.BIN_DIR}}/{{.API_BIN_NAME}} ./cmd/iso-api
 
   build-cache-fill:
     desc: Build the iso-cache-fill command
     cmds:
       - mkdir -p {{.BIN_DIR}}
-      - env GOCACHE={{.GO_CACHE}} go build -o {{.BIN_DIR}}/{{.CACHE_FILL_BIN_NAME}} ./cmd/iso-cache-fill
+      - env GOCACHE={{.GO_CACHE}} GOMODCACHE={{.GO_MOD_CACHE}} go build -o {{.BIN_DIR}}/{{.CACHE_FILL_BIN_NAME}} ./cmd/iso-cache-fill
+
+  embeddings:download-minilm:
+    desc: Download local CPU MiniLM ONNX embedding artifacts
+    status:
+      - test -f {{.MINILM_DIR}}/model.onnx
+      - test -f {{.MINILM_DIR}}/vocab.txt
+    cmds:
+      - mkdir -p {{.MINILM_DIR}}
+      - curl -L --fail --retry 3 -o {{.MINILM_DIR}}/model.onnx https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx
+      - curl -L --fail --retry 3 -o {{.MINILM_DIR}}/vocab.txt https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/vocab.txt
+
+  onnxruntime:download-darwin-arm64:
+    desc: Download ONNX Runtime {{.ONNXRUNTIME_VERSION}} for macOS arm64
+    status:
+      - test -f {{.ONNXRUNTIME_OSX_ARM64_LIB}}
+    cmds:
+      - mkdir -p .onnxruntime
+      - curl -L --fail --retry 3 -o .onnxruntime/onnxruntime-osx-arm64-{{.ONNXRUNTIME_VERSION}}.tgz https://github.com/microsoft/onnxruntime/releases/download/v{{.ONNXRUNTIME_VERSION}}/onnxruntime-osx-arm64-{{.ONNXRUNTIME_VERSION}}.tgz
+      - tar -xzf .onnxruntime/onnxruntime-osx-arm64-{{.ONNXRUNTIME_VERSION}}.tgz -C .onnxruntime
 
   pg0:start:
     desc: Start the local pg0 cache database
@@ -82,15 +106,35 @@ tasks:
         {{if .ENABLE_LLM_JUDGE}}--enable-llm-judge --judge-model {{.JUDGE_MODEL}}{{end}}
         {{if .REVIEW_PATH}}--review-path {{.REVIEW_PATH}}{{end}}
 
+  cache-fill:dataaddr-local:
+    desc: Fill pg0 cache from DataAddr using in-process MiniLM ONNX embeddings
+    deps:
+      - embeddings:download-minilm
+      - onnxruntime:download-darwin-arm64
+      - build-cache-fill
+    cmds:
+      - >
+        DATABASE_URL={{.PG0_DATABASE_URL}}
+        ISO20022_ONNX_RUNTIME={{.ISO20022_ONNX_RUNTIME | default .ONNXRUNTIME_OSX_ARM64_LIB}}
+        {{.BIN_DIR}}/{{.CACHE_FILL_BIN_NAME}}
+        --embedding-backend onnx
+        --input-path {{.DATAADDR_DIR | default "/Volumes/cax-t7/Data/DataAddr"}}
+        --resources-dir {{.RESOURCES_DIR | default "resources"}}
+        --model-dir {{.MODEL_DIR | default "resources/models"}}
+        {{if .COUNTRY}}--country {{.COUNTRY}}{{end}}
+        {{if .MAX_RECORDS}}--max-records {{.MAX_RECORDS}}{{end}}
+        {{if .ENABLE_LLM_JUDGE}}--enable-llm-judge --judge-model {{.JUDGE_MODEL}}{{end}}
+        {{if .REVIEW_PATH}}--review-path {{.REVIEW_PATH}}{{end}}
+
   lint:
     desc: Run Go linters
     cmds:
-      - env GOCACHE={{.GO_CACHE}} GOLANGCI_LINT_CACHE={{.GOLANGCI_LINT_CACHE}} golangci-lint run ./...
+      - env GOCACHE={{.GO_CACHE}} GOMODCACHE={{.GO_MOD_CACHE}} GOLANGCI_LINT_CACHE={{.GOLANGCI_LINT_CACHE}} golangci-lint run ./...
 
   tidy:
     desc: Tidy Go module dependencies
     cmds:
-      - go mod tidy
+      - env GOCACHE={{.GO_CACHE}} GOMODCACHE={{.GO_MOD_CACHE}} go mod tidy
 
   verify:
     desc: Run tests and linters
