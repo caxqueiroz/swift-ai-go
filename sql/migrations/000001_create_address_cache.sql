@@ -16,11 +16,12 @@ CREATE TABLE IF NOT EXISTS address_cache (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS address_cache_embedding_cos_idx
-    ON address_cache USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
-
 CREATE INDEX IF NOT EXISTS address_cache_normalized_trgm_idx
     ON address_cache USING gin (normalized_address gin_trgm_ops);
 
 CREATE INDEX IF NOT EXISTS address_cache_source_idx
     ON address_cache (source);
+
+-- Add a vector index after choosing a fixed embedding dimension/model, for example:
+-- CREATE INDEX address_cache_embedding_cos_1536_idx
+--     ON address_cache USING ivfflat ((embedding::vector(1536)) vector_cosine_ops) WITH (lists = 100);

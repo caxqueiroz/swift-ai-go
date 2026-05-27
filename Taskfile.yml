@@ -7,6 +7,12 @@ vars:
   CACHE_FILL_BIN_NAME: iso-cache-fill
   GO_CACHE: /private/tmp/swift-ai-go-build
   GOLANGCI_LINT_CACHE: /private/tmp/swift-ai-golangci-lint
+  PG0_NAME: swift-ai-cache
+  PG0_DATABASE: swift_ai
+  PG0_USER: postgres
+  PG0_PASSWORD: postgres
+  PG0_DATA_DIR: /private/tmp/swift-ai-pg0/data
+  PG0_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/swift_ai
 
 tasks:
   default:
@@ -39,6 +45,42 @@ tasks:
     cmds:
       - mkdir -p {{.BIN_DIR}}
       - env GOCACHE={{.GO_CACHE}} go build -o {{.BIN_DIR}}/{{.CACHE_FILL_BIN_NAME}} ./cmd/iso-cache-fill
+
+  pg0:start:
+    desc: Start the local pg0 cache database
+    cmds:
+      - pg0 start --name {{.PG0_NAME}} --database {{.PG0_DATABASE}} --username {{.PG0_USER}} --password {{.PG0_PASSWORD}} --data-dir {{.PG0_DATA_DIR}}
+
+  pg0:migrate:
+    desc: Apply cache migration to the local pg0 database
+    cmds:
+      - pg0 psql --name {{.PG0_NAME}} -- -f sql/migrations/000001_create_address_cache.sql
+
+  pg0:info:
+    desc: Show local pg0 cache database info
+    cmds:
+      - pg0 info --name {{.PG0_NAME}} --output json
+
+  pg0:stop:
+    desc: Stop the local pg0 cache database
+    cmds:
+      - pg0 stop --name {{.PG0_NAME}}
+
+  cache-fill:dataaddr:
+    desc: Fill pg0 cache from OpenAddresses DataAddr corpus
+    deps:
+      - build-cache-fill
+    cmds:
+      - >
+        DATABASE_URL={{.PG0_DATABASE_URL}}
+        {{.BIN_DIR}}/{{.CACHE_FILL_BIN_NAME}}
+        --input-path {{.DATAADDR_DIR | default "/Volumes/cax-t7/Data/DataAddr"}}
+        --resources-dir {{.RESOURCES_DIR | default "resources"}}
+        --model-dir {{.MODEL_DIR | default "resources/models"}}
+        {{if .COUNTRY}}--country {{.COUNTRY}}{{end}}
+        {{if .MAX_RECORDS}}--max-records {{.MAX_RECORDS}}{{end}}
+        {{if .ENABLE_LLM_JUDGE}}--enable-llm-judge --judge-model {{.JUDGE_MODEL}}{{end}}
+        {{if .REVIEW_PATH}}--review-path {{.REVIEW_PATH}}{{end}}
 
   lint:
     desc: Run Go linters

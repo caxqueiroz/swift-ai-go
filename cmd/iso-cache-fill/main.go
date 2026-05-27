@@ -1,15 +1,19 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -46,6 +50,8 @@ type fillOptions struct {
 	mediumConfidenceThreshold float64
 	reviewPath                string
 	dryRun                    bool
+	maxRecords                int
+	countryFilter             string
 }
 
 func main() {
@@ -60,11 +66,16 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		return 2
 	}
 
-	samples, err := readSamples(opts.inputPath)
+	source, err := openSampleSource(opts.inputPath, opts)
 	if err != nil {
-		logger.Error("read input", "error", err)
+		logger.Error("open input", "error", err)
 		return 1
 	}
+	defer func() {
+		if err := source.Close(); err != nil {
+			logger.Error("close input", "error", err)
+		}
+	}()
 
 	cfg := config.Default()
 	cfg.BatchSize = opts.batchSize
@@ -91,12 +102,6 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		}
 	}()
 
-	results, err := pipeline.New(cfg, &db, modelRunner).Run(ctx, samples)
-	if err != nil {
-		logger.Error("run pipeline", "error", err)
-		return 1
-	}
-
 	var store *cache.PostgresStore
 	var embedder *embedding.OpenAICompatible
 	var adjudicator judgepkg.Client
@@ -116,20 +121,34 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		}
 	}
 
-	summary, err := fillCache(ctx, samples, results, store, embedder, adjudicator, opts)
+	var reviews *reviewFileWriter
+	if opts.reviewPath != "" {
+		reviews, err = newReviewFileWriter(opts.reviewPath)
+		if err != nil {
+			logger.Error("open review rows", "error", err)
+			return 1
+		}
+	}
+
+	summary, err := fillFromSource(ctx, source, pipeline.New(cfg, &db, modelRunner), store, embedder, adjudicator, reviews, opts)
 	if err != nil {
+		if reviews != nil {
+			if closeErr := reviews.Close(); closeErr != nil {
+				logger.Error("close review rows", "error", closeErr)
+			}
+		}
 		logger.Error("fill cache", "error", err)
 		return 1
 	}
-	if opts.reviewPath != "" {
-		if err := writeReview(opts.reviewPath, summary.ReviewRows); err != nil {
-			logger.Error("write review rows", "error", err)
+	if reviews != nil {
+		if err := reviews.Close(); err != nil {
+			logger.Error("close review rows", "error", err)
 			return 1
 		}
 	}
 
 	if _, err := fmt.Fprintf(stdout, "processed=%d cached=%d review=%d skipped=%d\n",
-		summary.Processed, summary.Cached, len(summary.ReviewRows), summary.Skipped); err != nil {
+		summary.Processed, summary.Cached, summary.ReviewCount, summary.Skipped); err != nil {
 		logger.Error("write summary", "error", err)
 		return 1
 	}
@@ -184,6 +203,8 @@ func parseArgs(args []string, stderr io.Writer) (fillOptions, error) {
 	fs.Float64Var(&opts.mediumConfidenceThreshold, "medium-confidence-threshold", opts.mediumConfidenceThreshold, "minimum country/town confidence for medium-band review")
 	fs.StringVar(&opts.reviewPath, "review-path", "", "optional JSON path for ambiguous rows")
 	fs.BoolVar(&opts.dryRun, "dry-run", false, "run pipeline and review export without writing cache")
+	fs.IntVar(&opts.maxRecords, "max-records", 0, "maximum input records to process; 0 means no limit")
+	fs.StringVar(&opts.countryFilter, "country", "", "optional ISO alpha-2 country folder to process when input path is a directory")
 	if err := fs.Parse(args); err != nil {
 		return fillOptions{}, err
 	}
@@ -210,6 +231,256 @@ func parseArgs(args []string, stderr io.Writer) (fillOptions, error) {
 		}
 	}
 	return opts, nil
+}
+
+func fillFromSource(ctx context.Context, source sampleSource, runner *pipeline.Pipeline, store cacheWriter, embedder cacheEmbedder, adjudicator judgepkg.Client, reviews reviewSink, opts fillOptions) (fillSummary, error) {
+	var summary fillSummary
+	batchSize := opts.batchSize
+	if batchSize <= 0 {
+		batchSize = 1024
+	}
+
+	for {
+		samples, err := source.NextBatch(batchSize)
+		if err != nil {
+			return summary, err
+		}
+		if len(samples) == 0 {
+			break
+		}
+
+		results, err := runner.Run(ctx, samples)
+		if err != nil {
+			return summary, fmt.Errorf("run pipeline after %d processed samples: %w", summary.Processed, err)
+		}
+
+		batchSummary, err := fillCacheWithReviews(ctx, samples, results, store, embedder, adjudicator, reviews, opts)
+		if err != nil {
+			return summary, err
+		}
+		mergeSummary(&summary, batchSummary)
+	}
+	return summary, nil
+}
+
+func mergeSummary(dst *fillSummary, src fillSummary) {
+	dst.Processed += src.Processed
+	dst.Cached += src.Cached
+	dst.Skipped += src.Skipped
+	dst.ReviewCount += src.ReviewCount
+	dst.ReviewRows = append(dst.ReviewRows, src.ReviewRows...)
+}
+
+type sampleSource interface {
+	NextBatch(batchSize int) ([]core.AddressSample, error)
+	Close() error
+}
+
+func openSampleSource(path string, opts fillOptions) (sampleSource, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("stat input path %q: %w", path, err)
+	}
+	if info.IsDir() {
+		files, err := geoJSONInputFiles(path, opts.countryFilter)
+		if err != nil {
+			return nil, err
+		}
+		if len(files) == 0 {
+			return nil, fmt.Errorf("no OpenAddresses address GeoJSON files found under %q", path)
+		}
+		return &geoJSONSource{files: files, maxRecords: opts.maxRecords}, nil
+	}
+	if strings.EqualFold(filepath.Ext(path), ".geojson") {
+		return &geoJSONSource{
+			files:      []geoJSONInputFile{{Path: path, CountryCode: countryCodeForGeoJSON(filepath.Dir(path), path)}},
+			maxRecords: opts.maxRecords,
+		}, nil
+	}
+
+	samples, err := readSamples(path)
+	if err != nil {
+		return nil, err
+	}
+	if opts.maxRecords > 0 && len(samples) > opts.maxRecords {
+		samples = samples[:opts.maxRecords]
+	}
+	return &memorySampleSource{samples: samples}, nil
+}
+
+type memorySampleSource struct {
+	samples []core.AddressSample
+	offset  int
+}
+
+func (s *memorySampleSource) NextBatch(batchSize int) ([]core.AddressSample, error) {
+	if s.offset >= len(s.samples) {
+		return nil, nil
+	}
+	if batchSize <= 0 {
+		batchSize = len(s.samples)
+	}
+	end := min(s.offset+batchSize, len(s.samples))
+	batch := s.samples[s.offset:end]
+	s.offset = end
+	return batch, nil
+}
+
+func (s *memorySampleSource) Close() error {
+	return nil
+}
+
+type geoJSONInputFile struct {
+	Path        string
+	CountryCode string
+}
+
+type geoJSONSource struct {
+	files       []geoJSONInputFile
+	fileIndex   int
+	current     *os.File
+	currentInfo geoJSONInputFile
+	scanner     *bufio.Scanner
+	records     int
+	maxRecords  int
+}
+
+func (s *geoJSONSource) NextBatch(batchSize int) ([]core.AddressSample, error) {
+	if batchSize <= 0 {
+		batchSize = 1024
+	}
+	batch := make([]core.AddressSample, 0, batchSize)
+	for len(batch) < batchSize {
+		if s.maxRecords > 0 && s.records >= s.maxRecords {
+			return batch, nil
+		}
+		if s.scanner == nil {
+			ok, err := s.openNext()
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				return batch, nil
+			}
+		}
+
+		for s.scanner.Scan() {
+			line := bytes.TrimSpace(s.scanner.Bytes())
+			if len(line) == 0 {
+				continue
+			}
+			sample, ok, err := readers.ParseOpenAddressesFeature(line, s.currentInfo.CountryCode)
+			if err != nil {
+				return nil, fmt.Errorf("parse %q: %w", s.currentInfo.Path, err)
+			}
+			if !ok {
+				continue
+			}
+			batch = append(batch, sample)
+			s.records++
+			if len(batch) == batchSize || (s.maxRecords > 0 && s.records >= s.maxRecords) {
+				return batch, nil
+			}
+		}
+		if err := s.scanner.Err(); err != nil {
+			return nil, fmt.Errorf("scan %q: %w", s.currentInfo.Path, err)
+		}
+		if err := s.closeCurrent(); err != nil {
+			return nil, err
+		}
+	}
+	return batch, nil
+}
+
+func (s *geoJSONSource) Close() error {
+	return s.closeCurrent()
+}
+
+func (s *geoJSONSource) openNext() (bool, error) {
+	if s.fileIndex >= len(s.files) {
+		return false, nil
+	}
+	info := s.files[s.fileIndex]
+	s.fileIndex++
+
+	file, err := os.Open(info.Path)
+	if err != nil {
+		return false, fmt.Errorf("open OpenAddresses GeoJSON file %q: %w", info.Path, err)
+	}
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxOpenAddressesLineBytes)
+
+	s.current = file
+	s.currentInfo = info
+	s.scanner = scanner
+	return true, nil
+}
+
+func (s *geoJSONSource) closeCurrent() error {
+	if s.current == nil {
+		s.scanner = nil
+		return nil
+	}
+	err := s.current.Close()
+	s.current = nil
+	s.currentInfo = geoJSONInputFile{}
+	s.scanner = nil
+	if err != nil {
+		return fmt.Errorf("close OpenAddresses GeoJSON file: %w", err)
+	}
+	return nil
+}
+
+const maxOpenAddressesLineBytes = 10 * 1024 * 1024
+
+func geoJSONInputFiles(root string, countryFilter string) ([]geoJSONInputFile, error) {
+	countryFilter = strings.ToUpper(strings.TrimSpace(countryFilter))
+	var files []geoJSONInputFile
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || !isAddressGeoJSONFile(entry.Name()) {
+			return nil
+		}
+		countryCode := countryCodeForGeoJSON(root, path)
+		if countryFilter != "" && countryCode != countryFilter {
+			return nil
+		}
+		files = append(files, geoJSONInputFile{Path: path, CountryCode: countryCode})
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("walk OpenAddresses directory %q: %w", root, err)
+	}
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Path < files[j].Path
+	})
+	return files, nil
+}
+
+func isAddressGeoJSONFile(name string) bool {
+	lower := strings.ToLower(name)
+	return strings.HasSuffix(lower, ".geojson") && strings.Contains(lower, "addresses")
+}
+
+func countryCodeForGeoJSON(root string, path string) string {
+	parent := filepath.Base(filepath.Dir(path))
+	if len(parent) == 2 {
+		return strings.ToUpper(parent)
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return ""
+	}
+	first := rel
+	if index := strings.IndexRune(rel, filepath.Separator); index >= 0 {
+		first = rel[:index]
+	}
+	if len(first) == 2 {
+		return strings.ToUpper(first)
+	}
+	return ""
 }
 
 func readSamples(path string) ([]core.AddressSample, error) {
@@ -260,10 +531,11 @@ type cacheEmbedder interface {
 }
 
 type fillSummary struct {
-	Processed  int
-	Cached     int
-	Skipped    int
-	ReviewRows []reviewRow
+	Processed   int
+	Cached      int
+	Skipped     int
+	ReviewCount int
+	ReviewRows  []reviewRow
 }
 
 type reviewRow struct {
@@ -275,7 +547,77 @@ type reviewRow struct {
 	Reason            string  `json:"reason"`
 }
 
+type reviewSink interface {
+	Add(row reviewRow) error
+}
+
+type reviewFileWriter struct {
+	file  *os.File
+	count int
+}
+
+func newReviewFileWriter(path string) (*reviewFileWriter, error) {
+	file, err := os.Create(path)
+	if err != nil {
+		return nil, fmt.Errorf("create review path %q: %w", path, err)
+	}
+	if _, err := io.WriteString(file, "["); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("start review JSON: %w", err)
+	}
+	return &reviewFileWriter{file: file}, nil
+}
+
+func (w *reviewFileWriter) Add(row reviewRow) error {
+	if w == nil || w.file == nil {
+		return errors.New("review writer is closed")
+	}
+	if w.count == 0 {
+		if _, err := io.WriteString(w.file, "\n"); err != nil {
+			return fmt.Errorf("write review separator: %w", err)
+		}
+	} else if _, err := io.WriteString(w.file, ",\n"); err != nil {
+		return fmt.Errorf("write review separator: %w", err)
+	}
+	data, err := json.Marshal(row)
+	if err != nil {
+		return fmt.Errorf("encode review row: %w", err)
+	}
+	if _, err := io.WriteString(w.file, "  "); err != nil {
+		return fmt.Errorf("write review indent: %w", err)
+	}
+	if _, err := w.file.Write(data); err != nil {
+		return fmt.Errorf("write review row: %w", err)
+	}
+	w.count++
+	return nil
+}
+
+func (w *reviewFileWriter) Close() error {
+	if w == nil || w.file == nil {
+		return nil
+	}
+	suffix := "]\n"
+	if w.count > 0 {
+		suffix = "\n]\n"
+	}
+	_, writeErr := io.WriteString(w.file, suffix)
+	closeErr := w.file.Close()
+	w.file = nil
+	if writeErr != nil {
+		return fmt.Errorf("finish review JSON: %w", writeErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close review file: %w", closeErr)
+	}
+	return nil
+}
+
 func fillCache(ctx context.Context, samples []core.AddressSample, results []core.Result, store cacheWriter, embedder cacheEmbedder, adjudicator judgepkg.Client, opts fillOptions) (fillSummary, error) {
+	return fillCacheWithReviews(ctx, samples, results, store, embedder, adjudicator, nil, opts)
+}
+
+func fillCacheWithReviews(ctx context.Context, samples []core.AddressSample, results []core.Result, store cacheWriter, embedder cacheEmbedder, adjudicator judgepkg.Client, reviews reviewSink, opts fillOptions) (fillSummary, error) {
 	if len(samples) != len(results) {
 		return fillSummary{}, fmt.Errorf("sample/result length mismatch: %d samples, %d results", len(samples), len(results))
 	}
@@ -316,8 +658,9 @@ func fillCache(ctx context.Context, samples []core.AddressSample, results []core
 				}
 				continue
 			}
-			summary.ReviewRows = append(summary.ReviewRows, newReviewRow(samples[i].Text, address, "judge_unresolved"))
-			summary.Skipped++
+			if err := addReviewRow(&summary, newReviewRow(samples[i].Text, address, "judge_unresolved"), reviews, opts); err != nil {
+				return summary, err
+			}
 			continue
 		}
 
@@ -325,10 +668,23 @@ func fillCache(ctx context.Context, samples []core.AddressSample, results []core
 		if reason == "" {
 			reason = string(assessment.Reason)
 		}
-		summary.ReviewRows = append(summary.ReviewRows, newReviewRow(samples[i].Text, address, reason))
-		summary.Skipped++
+		if err := addReviewRow(&summary, newReviewRow(samples[i].Text, address, reason), reviews, opts); err != nil {
+			return summary, err
+		}
 	}
 	return summary, nil
+}
+
+func addReviewRow(summary *fillSummary, row reviewRow, reviews reviewSink, opts fillOptions) error {
+	summary.Skipped++
+	summary.ReviewCount++
+	if reviews != nil {
+		return reviews.Add(row)
+	}
+	if opts.reviewPath != "" {
+		summary.ReviewRows = append(summary.ReviewRows, row)
+	}
+	return nil
 }
 
 func writeCacheEntry(ctx context.Context, input string, address structured.Address, source cache.Source, store cacheWriter, embedder cacheEmbedder, opts fillOptions) (bool, error) {
@@ -447,18 +803,6 @@ func newReviewRow(input string, address structured.Address, reason string) revie
 		TownConfidence:    address.TownConfidence,
 		Reason:            reason,
 	}
-}
-
-func writeReview(path string, rows []reviewRow) error {
-	data, err := json.MarshalIndent(rows, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encode review rows: %w", err)
-	}
-	data = append(data, '\n')
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return fmt.Errorf("write review path: %w", err)
-	}
-	return nil
 }
 
 func envDefault(name string, fallback string) string {

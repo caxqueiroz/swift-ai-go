@@ -236,9 +236,30 @@ The migration creates:
 - `address_cache`
 - `pgvector` extension
 - `pg_trgm` extension
-- cosine vector index
 - trigram index on normalized address
 - source provenance index
+
+The vector column is intentionally dimension-agnostic because embedding dimensions depend on the chosen embedding model. After you standardize on a model/dimension, add a dimension-specific vector index, for example:
+
+```sql
+CREATE INDEX address_cache_embedding_cos_1536_idx
+    ON address_cache USING ivfflat ((embedding::vector(1536)) vector_cosine_ops) WITH (lists = 100);
+```
+
+### Local pg0 Database
+
+This repo includes Taskfile helpers for a local `pg0` cache database:
+
+```bash
+task pg0:start
+task pg0:migrate
+```
+
+The default local connection URI is:
+
+```text
+postgresql://postgres:postgres@127.0.0.1:5432/swift_ai
+```
 
 ## Fill The Semantic Cache
 
@@ -265,6 +286,9 @@ Useful flags:
 | Flag | Purpose |
 |------|---------|
 | `--dry-run` | Run Stage 2 and review export without writing cache. |
+| `--input-path` | Input file or OpenAddresses/DataAddr directory. Files support `.txt`, `.csv`, `.tsv`, and `.geojson`; directories are scanned for `*addresses*.geojson`. |
+| `--country` | Optional ISO alpha-2 country folder filter for DataAddr directory input, e.g. `SG` or `US`. |
+| `--max-records` | Stop after N extracted input records. Use this for smoke tests before full corpus runs. |
 | `--high-confidence-threshold` | Minimum country/town confidence for direct `crf_pipeline` cache writes. Default `0.95`. |
 | `--medium-confidence-threshold` | Lower band boundary for uncertain but potentially judgeable rows. Default `0.80`. |
 | `--enable-llm-judge` | Send non-high-confidence rows to the constrained LLM judge. |
@@ -282,6 +306,43 @@ The cache-fill path does not treat LLM output as truth. The recommended flow is:
 5. Cache valid LLM-reviewed rows as `llm_assisted`.
 6. Export unresolved rows for human review.
 7. Promote rows to `human_verified` only after human review.
+
+### Fill From DataAddr
+
+The mounted address corpus is OpenAddresses-style newline-delimited GeoJSON. In this environment it is under:
+
+```text
+/Volumes/cax-t7/Data/DataAddr
+```
+
+Run a small smoke fill first:
+
+```bash
+task pg0:start
+task pg0:migrate
+
+ISO20022_ONNX_RUNTIME=/path/to/libonnxruntime.dylib \
+OPENAI_API_KEY=$OPENAI_API_KEY \
+EMBEDDING_MODEL=text-embedding-model \
+task cache-fill:dataaddr COUNTRY=SG MAX_RECORDS=100 \
+  RESOURCES_DIR=/path/to/upstream/resources \
+  MODEL_DIR=resources/models \
+  REVIEW_PATH=/tmp/address-review-sg.json
+```
+
+Then remove `MAX_RECORDS` to process the selected country, or remove `COUNTRY` to scan the whole corpus:
+
+```bash
+ISO20022_ONNX_RUNTIME=/path/to/libonnxruntime.dylib \
+OPENAI_API_KEY=$OPENAI_API_KEY \
+EMBEDDING_MODEL=text-embedding-model \
+task cache-fill:dataaddr COUNTRY=SG \
+  RESOURCES_DIR=/path/to/upstream/resources \
+  MODEL_DIR=resources/models \
+  REVIEW_PATH=/tmp/address-review-sg.json
+```
+
+For DataAddr directory input, the parent country folder is used only as an offline batch hint to improve GeoNames disambiguation. `/convert` still accepts free text only and infers country/town itself.
 
 ## Parity Check
 

@@ -147,6 +147,49 @@ func TestReadDelimitedSupportsTSV(t *testing.T) {
 	}
 }
 
+func TestReadOpenAddressesGeoJSONBuildsFreeTextWithCountryHint(t *testing.T) {
+	path := writeTempFile(t, "addresses.geojson", strings.Join([]string{
+		`{"type":"Feature","properties":{"number":"101A","street":"BAYFRONT AVENUE","unit":"TEMPORARY SITE OFFICE","city":"","district":"","region":"","postcode":"018895"}}`,
+		`{"type":"Feature","properties":{"number":"2","street":"PARK STREET","unit":"NIL","city":"SINGAPORE","region":"CENTRAL","postcode":"018928"}}`,
+	}, "\n"))
+
+	got, err := ReadOpenAddressesGeoJSON(path, OpenAddressesOptions{CountryCode: "sg"})
+	if err != nil {
+		t.Fatalf("ReadOpenAddressesGeoJSON() error = %v", err)
+	}
+
+	want := []core.AddressSample{
+		{
+			Text:                "101A BAYFRONT AVENUE\nTEMPORARY SITE OFFICE\n018895",
+			SuggestedCountry:    "SG",
+			HasSuggestedCountry: true,
+		},
+		{
+			Text:                "2 PARK STREET\n018928 SINGAPORE\nCENTRAL",
+			SuggestedCountry:    "SG",
+			HasSuggestedCountry: true,
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadOpenAddressesGeoJSON() = %#v, want %#v", got, want)
+	}
+}
+
+func TestReadOpenAddressesGeoJSONRespectsMaxRecords(t *testing.T) {
+	path := writeTempFile(t, "addresses.geojson", strings.Join([]string{
+		`{"type":"Feature","properties":{"number":"1","street":"A ROAD"}}`,
+		`{"type":"Feature","properties":{"number":"2","street":"B ROAD"}}`,
+	}, "\n"))
+
+	got, err := ReadOpenAddressesGeoJSON(path, OpenAddressesOptions{MaxRecords: 1})
+	if err != nil {
+		t.Fatalf("ReadOpenAddressesGeoJSON() error = %v", err)
+	}
+	if len(got) != 1 || got[0].Text != "1 A ROAD" {
+		t.Fatalf("ReadOpenAddressesGeoJSON() = %#v, want first record only", got)
+	}
+}
+
 func writeTempFile(t *testing.T, name, content string) string {
 	t.Helper()
 
