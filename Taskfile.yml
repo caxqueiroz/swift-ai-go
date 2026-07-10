@@ -114,6 +114,9 @@ tasks:
         --model-dir {{.MODEL_DIR | default "resources/models"}}
         {{if .COUNTRY}}--country {{.COUNTRY}}{{end}}
         {{if .MAX_RECORDS}}--max-records {{.MAX_RECORDS}}{{end}}
+        {{if .HOLDOUT_MOD}}--holdout-mod {{.HOLDOUT_MOD}}{{end}}
+        {{if .HOLDOUT_MIN_BUCKET}}--holdout-min-bucket {{.HOLDOUT_MIN_BUCKET}}{{end}}
+        {{if .HOLDOUT_MAX_BUCKET}}--holdout-max-bucket {{.HOLDOUT_MAX_BUCKET}}{{end}}
         {{if .ENABLE_LLM_JUDGE}}--enable-llm-judge --judge-model {{.JUDGE_MODEL}}{{end}}
         {{if .REVIEW_PATH}}--review-path {{.REVIEW_PATH}}{{end}}
 
@@ -134,6 +137,9 @@ tasks:
         --model-dir {{.MODEL_DIR | default "resources/models"}}
         {{if .COUNTRY}}--country {{.COUNTRY}}{{end}}
         {{if .MAX_RECORDS}}--max-records {{.MAX_RECORDS}}{{end}}
+        {{if .HOLDOUT_MOD}}--holdout-mod {{.HOLDOUT_MOD}}{{end}}
+        {{if .HOLDOUT_MIN_BUCKET}}--holdout-min-bucket {{.HOLDOUT_MIN_BUCKET}}{{end}}
+        {{if .HOLDOUT_MAX_BUCKET}}--holdout-max-bucket {{.HOLDOUT_MAX_BUCKET}}{{end}}
         {{if .ENABLE_LLM_JUDGE}}--enable-llm-judge --judge-model {{.JUDGE_MODEL}}{{end}}
         {{if .REVIEW_PATH}}--review-path {{.REVIEW_PATH}}{{end}}
 
@@ -144,13 +150,53 @@ tasks:
         env GOCACHE={{.GO_CACHE}} GOMODCACHE={{.GO_MOD_CACHE}}
         go run ./examples/client
         --sqlite {{.SQLITE | default .DATAADDR_SQLITE}}
-        --api-url {{.API_URL | default "http://localhost:8080/convert"}}
+        --api-url {{.API_URL | default "http://127.0.0.1:8080/convert"}}
         --limit {{.LIMIT | default 1000}}
         --batch-size {{.BATCH_SIZE | default 50}}
         --seed {{.SEED | default 42}}
+        --timeout {{.TIMEOUT | default "0"}}
+        --request-timeout {{.REQUEST_TIMEOUT | default "10m"}}
         --input-mode {{.INPUT_MODE | default "address-town"}}
         {{if .COUNTRY}}--country {{.COUNTRY}}{{end}}
         {{if .MISMATCHES}}--mismatches {{.MISMATCHES}}{{end}}
+        {{if .LOG_ALL}}--log-all{{end}}
+        {{if .HOLDOUT_MOD}}--holdout-mod {{.HOLDOUT_MOD}}{{end}}
+        {{if .HOLDOUT_MIN_BUCKET}}--holdout-min-bucket {{.HOLDOUT_MIN_BUCKET}}{{end}}
+        {{if .HOLDOUT_MAX_BUCKET}}--holdout-max-bucket {{.HOLDOUT_MAX_BUCKET}}{{end}}
+        {{if .INCLUDE_BLANK_TOWN}}--include-blank-town{{end}}
+
+  eval:dataaddr-inventory:
+    desc: Inventory DataAddr country shards and readiness
+    cmds:
+      - >
+        env GOCACHE={{.GO_CACHE}} GOMODCACHE={{.GO_MOD_CACHE}}
+        go run ./examples/client
+        --inventory
+        --sqlite {{.SQLITE | default .DATAADDR_SQLITE}}
+        {{if .COUNTRIES}}--countries {{.COUNTRIES}}{{end}}
+
+  eval:dataaddr-sweep:
+    desc: Evaluate /convert across ready DataAddr country shards
+    cmds:
+      - >
+        env GOCACHE={{.GO_CACHE}} GOMODCACHE={{.GO_MOD_CACHE}}
+        go run ./examples/client
+        --sweep
+        --sqlite {{.SQLITE | default .DATAADDR_SQLITE}}
+        --api-url {{.API_URL | default "http://127.0.0.1:8080/convert"}}
+        --limit {{.LIMIT | default 100}}
+        --batch-size {{.BATCH_SIZE | default 50}}
+        --seed {{.SEED | default 42}}
+        --timeout {{.TIMEOUT | default "0"}}
+        --request-timeout {{.REQUEST_TIMEOUT | default "10m"}}
+        --input-mode {{.INPUT_MODE | default "address-town-country"}}
+        {{if .COUNTRIES}}--countries {{.COUNTRIES}}{{end}}
+        {{if .MAX_COUNTRIES}}--max-countries {{.MAX_COUNTRIES}}{{end}}
+        {{if .OUTPUT_DIR}}--output-dir {{.OUTPUT_DIR}}{{end}}
+        {{if .LOG_ALL}}--log-all{{end}}
+        {{if .HOLDOUT_MOD}}--holdout-mod {{.HOLDOUT_MOD}}{{end}}
+        {{if .HOLDOUT_MIN_BUCKET}}--holdout-min-bucket {{.HOLDOUT_MIN_BUCKET}}{{end}}
+        {{if .HOLDOUT_MAX_BUCKET}}--holdout-max-bucket {{.HOLDOUT_MAX_BUCKET}}{{end}}
         {{if .INCLUDE_BLANK_TOWN}}--include-blank-town{{end}}
 
   lint:
