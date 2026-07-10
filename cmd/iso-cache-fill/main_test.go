@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/tipmarket/swift-ai/internal/cache"
 	"github.com/tipmarket/swift-ai/internal/core"
+	"github.com/tipmarket/swift-ai/internal/holdout"
 	judgepkg "github.com/tipmarket/swift-ai/internal/judge"
 )
 
@@ -146,6 +148,32 @@ func TestOpenSampleSourceReadsDataAddrDirectoryWithCountryFilter(t *testing.T) {
 	}
 }
 
+func TestOpenSampleSourceExcludesHoldoutBuckets(t *testing.T) {
+	filter := holdout.Filter{Mod: 10, MinBucket: 8}
+	includedID := idForHoldoutBucket(t, filter, true)
+	excludedID := idForHoldoutBucket(t, filter, false)
+	path := filepath.Join(t.TempDir(), "addresses.csv")
+	writeFile(t, path, "id,address\n"+excludedID+",1 EXCLUDED ROAD\n"+includedID+",2 INCLUDED ROAD\n")
+
+	source, err := openSampleSource(path, fillOptions{holdout: filter})
+	if err != nil {
+		t.Fatalf("openSampleSource() error = %v", err)
+	}
+	defer func() {
+		if err := source.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	got, err := source.NextBatch(10)
+	if err != nil {
+		t.Fatalf("NextBatch() error = %v", err)
+	}
+	if len(got) != 1 || got[0].ID != includedID || got[0].Text != "2 INCLUDED ROAD" {
+		t.Fatalf("NextBatch() = %#v, want only included holdout row %q", got, includedID)
+	}
+}
+
 func TestReviewFileWriterStreamsJSONArray(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "review.json")
 	writer, err := newReviewFileWriter(path)
@@ -175,6 +203,24 @@ func TestReviewFileWriterStreamsJSONArray(t *testing.T) {
 	}
 }
 
+func TestParseArgsReadsHoldoutFlags(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "")
+
+	opts, err := parseArgs([]string{
+		"--dry-run",
+		"--input-path", "addresses.csv",
+		"--holdout-mod", "10",
+		"--holdout-min-bucket", "8",
+		"--holdout-max-bucket", "10",
+	}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseArgs() error = %v", err)
+	}
+	if opts.holdout.Mod != 10 || opts.holdout.MinBucket != 8 || opts.holdout.MaxBucket != 10 {
+		t.Fatalf("holdout = %#v, want mod 10 min bucket 8 max bucket 10", opts.holdout)
+	}
+}
+
 func TestParseArgsAllowsLocalEmbeddingEndpointWithoutAPIKey(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "")
 
@@ -187,6 +233,19 @@ func TestParseArgsAllowsLocalEmbeddingEndpointWithoutAPIKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseArgs() error = %v, want local embedding endpoint without API key", err)
 	}
+}
+
+func idForHoldoutBucket(t *testing.T, filter holdout.Filter, wantIncluded bool) string {
+	t.Helper()
+
+	for i := 0; i < 1000; i++ {
+		id := fmt.Sprintf("addr-%d", i)
+		if filter.Include(id) == wantIncluded {
+			return id
+		}
+	}
+	t.Fatalf("no id found with included=%t", wantIncluded)
+	return ""
 }
 
 type fakeCacheWriter struct {

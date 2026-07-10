@@ -22,6 +22,7 @@ import (
 	"github.com/tipmarket/swift-ai/internal/config"
 	"github.com/tipmarket/swift-ai/internal/core"
 	"github.com/tipmarket/swift-ai/internal/embedding"
+	"github.com/tipmarket/swift-ai/internal/holdout"
 	judgepkg "github.com/tipmarket/swift-ai/internal/judge"
 	"github.com/tipmarket/swift-ai/internal/pipeline"
 	"github.com/tipmarket/swift-ai/internal/quality"
@@ -56,6 +57,7 @@ type fillOptions struct {
 	dryRun                    bool
 	maxRecords                int
 	countryFilter             string
+	holdout                   holdout.Filter
 }
 
 func main() {
@@ -225,6 +227,9 @@ func parseArgs(args []string, stderr io.Writer) (fillOptions, error) {
 	fs.BoolVar(&opts.dryRun, "dry-run", false, "run pipeline and review export without writing cache")
 	fs.IntVar(&opts.maxRecords, "max-records", 0, "maximum input records to process; 0 means no limit")
 	fs.StringVar(&opts.countryFilter, "country", "", "optional ISO alpha-2 country folder to process when input path is a directory")
+	fs.IntVar(&opts.holdout.Mod, "holdout-mod", opts.holdout.Mod, "optional deterministic input holdout modulus; 0 disables holdout filtering")
+	fs.IntVar(&opts.holdout.MinBucket, "holdout-min-bucket", opts.holdout.MinBucket, "minimum stable input bucket to include when --holdout-mod is set")
+	fs.IntVar(&opts.holdout.MaxBucket, "holdout-max-bucket", opts.holdout.MaxBucket, "exclusive maximum stable input bucket to include when --holdout-mod is set; defaults to holdout-mod")
 	if err := fs.Parse(args); err != nil {
 		return fillOptions{}, err
 	}
@@ -245,6 +250,18 @@ func parseArgs(args []string, stderr io.Writer) (fillOptions, error) {
 		}
 		if opts.judgeModel == "" {
 			return fillOptions{}, errors.New("judge model is required when --enable-llm-judge is set")
+		}
+	}
+	if opts.holdout.Mod < 0 {
+		return fillOptions{}, errors.New("holdout-mod must be non-negative")
+	}
+	if opts.holdout.Enabled() {
+		maxBucket := opts.holdout.EffectiveMaxBucket()
+		if opts.holdout.MaxBucket < 0 || maxBucket > opts.holdout.Mod {
+			return fillOptions{}, errors.New("holdout-max-bucket must be between 1 and holdout-mod")
+		}
+		if opts.holdout.MinBucket < 0 || opts.holdout.MinBucket >= maxBucket {
+			return fillOptions{}, errors.New("holdout-min-bucket must be between 0 and holdout-max-bucket - 1")
 		}
 	}
 	return opts, nil
@@ -306,23 +323,29 @@ func openSampleSource(path string, opts fillOptions) (sampleSource, error) {
 		if len(files) == 0 {
 			return nil, fmt.Errorf("no OpenAddresses address GeoJSON files found under %q", path)
 		}
-		return &geoJSONSource{files: files, maxRecords: opts.maxRecords}, nil
+		return wrapSampleSource(&geoJSONSource{files: files}, opts), nil
 	}
 	if strings.EqualFold(filepath.Ext(path), ".geojson") {
-		return &geoJSONSource{
-			files:      []geoJSONInputFile{{Path: path, CountryCode: countryCodeForGeoJSON(filepath.Dir(path), path)}},
-			maxRecords: opts.maxRecords,
-		}, nil
+		return wrapSampleSource(&geoJSONSource{
+			files: []geoJSONInputFile{{Path: path, CountryCode: countryCodeForGeoJSON(filepath.Dir(path), path)}},
+		}, opts), nil
 	}
 
 	samples, err := readSamples(path)
 	if err != nil {
 		return nil, err
 	}
-	if opts.maxRecords > 0 && len(samples) > opts.maxRecords {
-		samples = samples[:opts.maxRecords]
+	return wrapSampleSource(&memorySampleSource{samples: samples}, opts), nil
+}
+
+func wrapSampleSource(source sampleSource, opts fillOptions) sampleSource {
+	if opts.holdout.Enabled() {
+		source = &holdoutSampleSource{source: source, filter: opts.holdout}
 	}
-	return &memorySampleSource{samples: samples}, nil
+	if opts.maxRecords > 0 {
+		source = &maxRecordsSampleSource{source: source, maxRecords: opts.maxRecords}
+	}
+	return source
 }
 
 type memorySampleSource struct {
@@ -345,6 +368,74 @@ func (s *memorySampleSource) NextBatch(batchSize int) ([]core.AddressSample, err
 
 func (s *memorySampleSource) Close() error {
 	return nil
+}
+
+type holdoutSampleSource struct {
+	source sampleSource
+	filter holdout.Filter
+}
+
+func (s *holdoutSampleSource) NextBatch(batchSize int) ([]core.AddressSample, error) {
+	if batchSize <= 0 {
+		batchSize = 1024
+	}
+	batch := make([]core.AddressSample, 0, batchSize)
+	for len(batch) < batchSize {
+		samples, err := s.source.NextBatch(batchSize)
+		if err != nil {
+			return nil, err
+		}
+		if len(samples) == 0 {
+			return batch, nil
+		}
+		for _, sample := range samples {
+			if !s.filter.Include(sampleHoldoutKey(sample)) {
+				continue
+			}
+			batch = append(batch, sample)
+			if len(batch) == batchSize {
+				break
+			}
+		}
+	}
+	return batch, nil
+}
+
+func (s *holdoutSampleSource) Close() error {
+	return s.source.Close()
+}
+
+type maxRecordsSampleSource struct {
+	source     sampleSource
+	maxRecords int
+	records    int
+}
+
+func (s *maxRecordsSampleSource) NextBatch(batchSize int) ([]core.AddressSample, error) {
+	remaining := s.maxRecords - s.records
+	if remaining <= 0 {
+		return nil, nil
+	}
+	if batchSize <= 0 || batchSize > remaining {
+		batchSize = remaining
+	}
+	batch, err := s.source.NextBatch(batchSize)
+	if err != nil {
+		return nil, err
+	}
+	s.records += len(batch)
+	return batch, nil
+}
+
+func (s *maxRecordsSampleSource) Close() error {
+	return s.source.Close()
+}
+
+func sampleHoldoutKey(sample core.AddressSample) string {
+	if strings.TrimSpace(sample.ID) != "" {
+		return sample.ID
+	}
+	return sample.Text
 }
 
 type geoJSONInputFile struct {
