@@ -39,6 +39,8 @@ type Item struct {
 	CacheSource      cache.Source       `json:"cache_source,omitempty"`
 	ResolutionStatus quality.Status     `json:"resolution_status"`
 	ConfidenceBand   quality.Band       `json:"confidence_band"`
+	QualityScore     float64            `json:"quality_score,omitempty"`
+	QualityReason    quality.Reason     `json:"quality_reason,omitempty"`
 	SemanticScore    *float64           `json:"semantic_score,omitempty"`
 	LexicalScore     *float64           `json:"lexical_score,omitempty"`
 	FallbackReason   string             `json:"fallback_reason,omitempty"`
@@ -270,6 +272,8 @@ func applyQuality(item *Item, thresholds quality.Thresholds) {
 	assessment := quality.Assess(item.Structured, thresholds)
 	item.ResolutionStatus = assessment.Status
 	item.ConfidenceBand = assessment.Band
+	item.QualityScore = assessment.Score
+	item.QualityReason = assessment.Reason
 }
 
 func (s *Service) trusted(source cache.Source) bool {
