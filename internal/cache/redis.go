@@ -189,7 +189,11 @@ func (s *RedisStore) Search(ctx context.Context, _ string, embedding []float64, 
 		limit = 5
 	}
 
-	q := query.NewVectorQuery("embedding", embedding).NumResults(limit)
+	// ReturnFields is required: the query builder defaults to returning only
+	// the vector distance. The builder re-appends query.DistanceID for us.
+	q := query.NewVectorQuery("embedding", embedding).
+		NumResults(limit).
+		ReturnFields("raw_address", "normalized_address", "source", "structured")
 	rows, err := s.index.Query(ctx, q)
 	if err != nil {
 		return nil, fmt.Errorf("search address cache: %w", err)
