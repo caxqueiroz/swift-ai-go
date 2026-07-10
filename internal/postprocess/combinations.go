@@ -67,6 +67,22 @@ func (g CombinationGenerator) Generate(countries, towns []core.FuzzyMatch, noCou
 	}
 
 	for _, country := range countries {
+		if !g.countryAllowed(country) || !trustedCountryCanPairAcrossTownOrigin(country) || hasSameOriginTown(country, towns) {
+			continue
+		}
+		for _, town := range towns {
+			if g.shouldSkipPair(country, town) {
+				continue
+			}
+			combinations = append(combinations, Combination{
+				Country: country,
+				Town:    town,
+				Score:   (country.FinalScore + town.FinalScore) / 2,
+			})
+		}
+	}
+
+	for _, country := range countries {
 		if !g.countryAllowed(country) {
 			continue
 		}
@@ -100,6 +116,22 @@ func (g CombinationGenerator) Generate(countries, towns []core.FuzzyMatch, noCou
 	})
 
 	return dedupeCombinations(combinations)
+}
+
+func trustedCountryCanPairAcrossTownOrigin(country core.FuzzyMatch) bool {
+	flagSet := newFlagSet(country.Flags)
+	return flagSet[core.FlagMLPStronglyAgrees] ||
+		flagSet[core.FlagIsSuggestedCountry] ||
+		flagSet[core.FlagGeneratedBySuggestedCountry]
+}
+
+func hasSameOriginTown(country core.FuzzyMatch, towns []core.FuzzyMatch) bool {
+	for _, town := range towns {
+		if town.Origin == country.Origin {
+			return true
+		}
+	}
+	return false
 }
 
 func (g CombinationGenerator) countryAllowed(country core.FuzzyMatch) bool {

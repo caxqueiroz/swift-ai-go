@@ -31,6 +31,23 @@ func TestCombinationMatchingCountryTownPairsAreGeneratedAndSorted(t *testing.T) 
 	assertSortedByScore(t, got)
 }
 
+func TestCombinationTrustedCountryCanPairWithCrossOriginTown(t *testing.T) {
+	generator := newDefaultCombinationGenerator(nil)
+	noCountry := createFuzzyMatch("NO COUNTRY", "NO COUNTRY", "NO COUNTRY", 0, 0, 0.15, nil)
+	noTown := createFuzzyMatch("NO TOWN", "NO TOWN", "NO TOWN", 0, 0, 0.15, nil)
+	countries := []core.FuzzyMatch{
+		createFuzzyMatch("SA", "SA", "AR", 10, 12, 0.84, nil),
+		createFuzzyMatch("SA", "SA", "SA", 10, 12, 0.93, []core.Flag{core.FlagMLPStronglyAgrees}),
+	}
+	towns := []core.FuzzyMatch{
+		createFuzzyMatch("L'YN", "L'YN", "AR", 5, 9, 0.90, nil),
+	}
+
+	got := generator.Generate(countries, towns, noCountry, noTown)
+
+	assertCombination(t, got[0], "SA", "L'YN", 0.915)
+}
+
 func TestCombinationSoloCountriesUseNoTown(t *testing.T) {
 	cfg := config.Default()
 	generator := newDefaultCombinationGenerator(nil)

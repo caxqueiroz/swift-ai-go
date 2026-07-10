@@ -3,6 +3,7 @@ package postprocess
 import (
 	"math"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/tipmarket/swift-ai/internal/config"
@@ -15,6 +16,7 @@ func TestRunnerSuggestedCountryCreatesGeneratedCountryMatch(t *testing.T) {
 	runner := NewRunner(cfg, resources.Database{})
 	crf := runnerTestCRF("Beneficiary address", nil, nil)
 	sample := core.AddressSample{
+		ID:                  "customer-1",
 		Text:                "Beneficiary address",
 		SuggestedCountry:    "JP",
 		HasSuggestedCountry: true,
@@ -28,6 +30,9 @@ func TestRunnerSuggestedCountryCreatesGeneratedCountryMatch(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
+	}
+	if got[0].ID != "customer-1" {
+		t.Fatalf("result ID = %q, want customer-1", got[0].ID)
 	}
 
 	country := got[0].FuzzyResult.CountryMatches[0]
@@ -145,6 +150,44 @@ func TestRunnerFiltersZeroScoreCountryCodesUnlessCountryHeadAgrees(t *testing.T)
 	if len(codeMatches) != 1 || codeMatches[0].Origin != "FR" {
 		t.Fatalf("country code matches = %#v, want only FR preserved by country head", codeMatches)
 	}
+}
+
+func TestRunnerFlagsCountryWhenPostcodeEvidenceMatchesOrigin(t *testing.T) {
+	cfg := runnerTestConfig()
+	runner := NewRunner(cfg, resources.Database{})
+	text := "PARK STREET 018928"
+	countryStart := strings.Index(text, "018928")
+	crf := runnerTestCRF(text, fillSeries(len(text), 0.4), nil)
+	fuzzy := core.FuzzyResult{
+		CountryMatches: []core.FuzzyMatch{{
+			Start:       countryStart,
+			End:         countryStart + len("018928"),
+			Matched:     "SG",
+			Possibility: "SINGAPORE",
+			Origin:      "SG",
+		}},
+	}
+
+	got, err := runner.Run(
+		[]core.CRFResult{crf},
+		[]core.FuzzyResult{fuzzy},
+		[][]core.PostcodeMatch{{{
+			Start:   countryStart,
+			End:     countryStart + len("018928"),
+			Matched: "018928",
+			Origin:  "SG",
+		}}},
+		[]core.AddressSample{{Text: text}},
+	)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	country := findCountryByPossibility(got[0].FuzzyResult.CountryMatches, "SINGAPORE")
+	if country == nil {
+		t.Fatalf("country matches = %#v, want SINGAPORE", got[0].FuzzyResult.CountryMatches)
+	}
+	assertFlags(t, country.Flags, core.FlagPostalCodeIsPresent)
 }
 
 func TestRunnerCountryHeadConfidenceControlsTownMLPFlag(t *testing.T) {
@@ -455,6 +498,168 @@ func TestRunnerOrdersFinalMatchesByCombinationScore(t *testing.T) {
 	}
 	if countries[1].Origin != "FR" || towns[1].Possibility != "PARIS" {
 		t.Fatalf("second combination = (%s, %s), want (FR, PARIS)", countries[1].Origin, towns[1].Possibility)
+	}
+}
+
+func TestRunnerPrefersPenultimateTownLineOverStreetLineCandidate(t *testing.T) {
+	cfg := runnerTestConfig()
+	runner := NewRunner(cfg, resources.Database{})
+	text := "113 PATAGUA ORILLA\nPICHIDEGUA\nCL"
+
+	countryStart := strings.Index(text, "CL")
+	streetTownStart := strings.Index(text, "PATAGUA ORILLA")
+	expectedTownStart := strings.Index(text, "PICHIDEGUA")
+
+	countryScores := fillSeries(len(text), 0.1)
+	townScores := fillSeries(len(text), 0.1)
+	setRange(countryScores, countryStart, countryStart+len("CL"), 0.95)
+	setRange(townScores, streetTownStart, streetTownStart+len("PATAGUA ORILLA"), 0.95)
+	setRange(townScores, expectedTownStart, expectedTownStart+len("PICHIDEGUA"), 0.80)
+
+	crf := runnerTestCRF(text, countryScores, townScores)
+	fuzzy := core.FuzzyResult{
+		CountryMatches: []core.FuzzyMatch{
+			{Start: countryStart, End: countryStart + len("CL"), Matched: "CL", Possibility: "CL", Origin: "CL"},
+		},
+		TownMatches: []core.FuzzyMatch{
+			{Start: streetTownStart, End: streetTownStart + len("PATAGUA ORILLA"), Matched: "PATAGUA ORILLA", Possibility: "PATAGUA ORILLA", Origin: "CL"},
+			{Start: expectedTownStart, End: expectedTownStart + len("PICHIDEGUA"), Matched: "PICHIDEGUA", Possibility: "PICHIDEGUA", Origin: "CL"},
+		},
+	}
+
+	got, err := runner.Run(
+		[]core.CRFResult{crf},
+		[]core.FuzzyResult{fuzzy},
+		[][]core.PostcodeMatch{nil},
+		[]core.AddressSample{{Text: text}},
+	)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	if got[0].FuzzyResult.TownMatches[0].Possibility != "PICHIDEGUA" {
+		t.Fatalf("top town = %#v, want PICHIDEGUA", got[0].FuzzyResult.TownMatches[0])
+	}
+}
+
+func TestRunnerInfersPenultimateTownLineWhenTownResourceCandidateIsMissing(t *testing.T) {
+	cfg := runnerTestConfig()
+	runner := NewRunner(cfg, resources.Database{})
+	text := "113 PATAGUA ORILLA\nPICHIDEGUA\nCL"
+
+	countryStart := strings.Index(text, "CL")
+	streetTownStart := strings.Index(text, "PATAGUA ORILLA")
+
+	countryScores := fillSeries(len(text), 0.1)
+	townScores := fillSeries(len(text), 0.1)
+	setRange(countryScores, countryStart, countryStart+len("CL"), 0.95)
+	setRange(townScores, streetTownStart, streetTownStart+len("PATAGUA ORILLA"), 0.95)
+
+	crf := runnerTestCRF(text, countryScores, townScores)
+	fuzzy := core.FuzzyResult{
+		CountryMatches: []core.FuzzyMatch{
+			{Start: countryStart, End: countryStart + len("CL"), Matched: "CL", Possibility: "CL", Origin: "CL"},
+		},
+		TownMatches: []core.FuzzyMatch{
+			{Start: streetTownStart, End: streetTownStart + len("PATAGUA ORILLA"), Matched: "PATAGUA ORILLA", Possibility: "PATAGUA ORILLA", Origin: "CL"},
+		},
+	}
+
+	got, err := runner.Run(
+		[]core.CRFResult{crf},
+		[]core.FuzzyResult{fuzzy},
+		[][]core.PostcodeMatch{nil},
+		[]core.AddressSample{{Text: text}},
+	)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	if got[0].FuzzyResult.TownMatches[0].Possibility != "PICHIDEGUA" {
+		t.Fatalf("top town = %#v, want inferred PICHIDEGUA", got[0].FuzzyResult.TownMatches[0])
+	}
+}
+
+func TestRunnerInfersPenultimateTownLineWhenEquivalentTownBelongsToDifferentCountry(t *testing.T) {
+	cfg := runnerTestConfig()
+	runner := NewRunner(cfg, resources.Database{})
+	text := "564 GRECIA\nCALERA\nCL"
+
+	countryStart := strings.Index(text, "CL")
+	townStart := strings.Index(text, "CALERA")
+
+	countryScores := fillSeries(len(text), 0.1)
+	townScores := fillSeries(len(text), 0.1)
+	setRange(countryScores, countryStart, countryStart+len("CL"), 0.95)
+	setRange(townScores, townStart, townStart+len("CALERA"), 0.95)
+
+	crf := runnerTestCRF(text, countryScores, townScores)
+	fuzzy := core.FuzzyResult{
+		CountryMatches: []core.FuzzyMatch{
+			{Start: countryStart, End: countryStart + len("CL"), Matched: "CL", Possibility: "CL", Origin: "CL"},
+		},
+		TownMatches: []core.FuzzyMatch{
+			{Start: townStart, End: townStart + len("CALERA"), Matched: "CALERA", Possibility: "CALERA", Origin: "US"},
+			{Start: townStart, End: townStart + len("CALERA"), Matched: "CALERA", Possibility: "CALDERA", Dist: 1, Origin: "CL"},
+		},
+	}
+
+	got, err := runner.Run(
+		[]core.CRFResult{crf},
+		[]core.FuzzyResult{fuzzy},
+		[][]core.PostcodeMatch{nil},
+		[]core.AddressSample{{Text: text}},
+	)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	if got[0].FuzzyResult.TownMatches[0].Possibility != "CALERA" || got[0].FuzzyResult.TownMatches[0].Origin != "CL" {
+		t.Fatalf("top town = %#v, want inferred CL/CALERA", got[0].FuzzyResult.TownMatches[0])
+	}
+}
+
+func TestRunnerPrefersFinalCountryLineOverEarlierShortCountryCandidate(t *testing.T) {
+	cfg := runnerTestConfig()
+	runner := NewRunner(cfg, resources.Database{})
+	text := "SN LOS JACINTOS\nPICHIDEGUA\nCL"
+
+	wrongCountryStart := strings.Index(text, "SN")
+	countryStart := strings.LastIndex(text, "CL")
+	townStart := strings.Index(text, "PICHIDEGUA")
+
+	countryScores := fillSeries(len(text), 0.1)
+	townScores := fillSeries(len(text), 0.1)
+	setRange(countryScores, wrongCountryStart, wrongCountryStart+len("SN"), 0.95)
+	setRange(countryScores, countryStart, countryStart+len("CL"), 0.50)
+	setRange(townScores, townStart, townStart+len("PICHIDEGUA"), 0.80)
+
+	crf := runnerTestCRF(text, countryScores, townScores)
+	fuzzy := core.FuzzyResult{
+		CountryMatches: []core.FuzzyMatch{
+			{Start: wrongCountryStart, End: wrongCountryStart + len("SN"), Matched: "SN", Possibility: "SN", Origin: "SN"},
+			{Start: countryStart, End: countryStart + len("CL"), Matched: "CL", Possibility: "CL", Origin: "CL"},
+		},
+		TownMatches: []core.FuzzyMatch{
+			{Start: townStart, End: townStart + len("PICHIDEGUA"), Matched: "PICHIDEGUA", Possibility: "PICHIDEGUA", Origin: "CL"},
+		},
+	}
+
+	got, err := runner.Run(
+		[]core.CRFResult{crf},
+		[]core.FuzzyResult{fuzzy},
+		[][]core.PostcodeMatch{nil},
+		[]core.AddressSample{{Text: text}},
+	)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	if got[0].FuzzyResult.CountryMatches[0].Origin != "CL" {
+		t.Fatalf("top country = %#v, want CL", got[0].FuzzyResult.CountryMatches[0])
+	}
+	if got[0].FuzzyResult.TownMatches[0].Possibility != "PICHIDEGUA" {
+		t.Fatalf("top town = %#v, want PICHIDEGUA", got[0].FuzzyResult.TownMatches[0])
 	}
 }
 
