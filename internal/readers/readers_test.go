@@ -49,6 +49,70 @@ func TestReadDelimitedReadsSuggestionColumns(t *testing.T) {
 	}
 }
 
+func TestReadDelimitedReadsOptionalIDColumn(t *testing.T) {
+	path := writeTempFile(t, "addresses.csv", strings.Join([]string{
+		"id,address",
+		"row-1,10 Downing St",
+	}, "\n"))
+
+	got, err := ReadDelimited(path, ',', DefaultAddressColumn)
+	if err != nil {
+		t.Fatalf("ReadDelimited() error = %v", err)
+	}
+
+	want := []core.AddressSample{{ID: "row-1", Text: "10 Downing St"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadDelimited() = %#v, want %#v", got, want)
+	}
+}
+
+func TestReadDelimitedWithOptionsReadsClientColumnNames(t *testing.T) {
+	path := writeTempFile(t, "addresses.csv", strings.Join([]string{
+		"client_ref,Customer_Address,country_hint,pin_country",
+		"cust-1,10 Downing St,gb,yes",
+	}, "\n"))
+
+	got, err := ReadDelimitedWithOptions(path, ',', DelimitedOptions{
+		IDColumn:                    "client_ref",
+		AddressColumn:               "customer_address",
+		SuggestedCountryColumn:      "country_hint",
+		ForceSuggestedCountryColumn: "pin_country",
+	})
+	if err != nil {
+		t.Fatalf("ReadDelimitedWithOptions() error = %v", err)
+	}
+
+	want := []core.AddressSample{
+		{
+			ID:                    "cust-1",
+			Text:                  "10 Downing St",
+			SuggestedCountry:      "GB",
+			HasSuggestedCountry:   true,
+			ForceSuggestedCountry: true,
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadDelimitedWithOptions() = %#v, want %#v", got, want)
+	}
+}
+
+func TestReadDelimitedWithOptionsSupportsSemicolonExports(t *testing.T) {
+	path := writeTempFile(t, "addresses.csv", strings.Join([]string{
+		"address;suggested_country",
+		"10 Downing St;gb",
+	}, "\n"))
+
+	got, err := ReadDelimitedWithOptions(path, ';', DefaultDelimitedOptions())
+	if err != nil {
+		t.Fatalf("ReadDelimitedWithOptions() error = %v", err)
+	}
+
+	want := []core.AddressSample{{Text: "10 Downing St", SuggestedCountry: "GB", HasSuggestedCountry: true}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadDelimitedWithOptions() = %#v, want %#v", got, want)
+	}
+}
+
 func TestReadDelimitedNormalizesPaddedAndBOMPrefixedHeaders(t *testing.T) {
 	path := writeTempFile(t, "addresses.csv", strings.Join([]string{
 		"\ufeff address , suggested_country , force_suggested_country ",

@@ -107,6 +107,21 @@ func TestWriteHumanReadableAlwaysEmitsSuggestedCountryColumns(t *testing.T) {
 	}
 }
 
+func TestWriteHumanReadableEmitsIDWhenPresent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "results.csv")
+	result := sampleResult()
+	result.ID = "customer-1"
+
+	rows := readHumanReadable(t, path, []core.Result{result}, false, false)
+	header := rows[0]
+	values := mapRow(header, rows[1])
+
+	assertHeaderContains(t, header, "id")
+	if got := values["id"]; got != "customer-1" {
+		t.Fatalf("id = %q, want customer-1", got)
+	}
+}
+
 func TestWriteHumanReadableInferredCountryColumnsFollowOption(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "results.csv")
 
@@ -171,6 +186,28 @@ func TestWriteJSONOmitsVerboseCRFTensorsWhenVerboseFalse(t *testing.T) {
 	}
 	if len(decoded) != 1 {
 		t.Fatalf("result count = %d, want 1", len(decoded))
+	}
+}
+
+func TestWriteJSONEmitsIDWhenPresent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "results.json")
+	result := sampleResult()
+	result.ID = "customer-1"
+
+	if err := WriteJSON(path, []core.Result{result}, false); err != nil {
+		t.Fatalf("writing json: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading json: %v", err)
+	}
+	var decoded []map[string]any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshalling json: %v", err)
+	}
+	if got := decoded[0]["id"]; got != "customer-1" {
+		t.Fatalf("id = %v, want customer-1", got)
 	}
 }
 

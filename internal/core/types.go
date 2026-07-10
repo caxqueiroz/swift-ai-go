@@ -64,6 +64,7 @@ type Details struct {
 }
 
 type AddressSample struct {
+	ID                    string
 	Text                  string
 	SuggestedCountry      string
 	HasSuggestedCountry   bool
@@ -155,6 +156,7 @@ type PostcodeMatch struct {
 }
 
 type Result struct {
+	ID                    string
 	CRFResult             CRFResult
 	FuzzyResult           FuzzyResult
 	IBANs                 []string
