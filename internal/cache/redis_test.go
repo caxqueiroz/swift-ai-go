@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"context"
 	"testing"
 
 	"github.com/tipmarket/swift-ai/internal/structured"
@@ -167,5 +168,59 @@ func TestEntryFromDocDecodesStoredFields(t *testing.T) {
 func TestEntryFromDocRejectsInvalidStructuredJSON(t *testing.T) {
 	if _, err := entryFromDoc(map[string]any{"structured": "{not json"}); err == nil {
 		t.Fatal("entryFromDoc() must reject invalid structured JSON")
+	}
+}
+
+func TestNewRedisStoreRequiresURL(t *testing.T) {
+	if _, err := NewRedisStore(context.Background(), "  ", 0); err == nil {
+		t.Fatal("NewRedisStore() must reject an empty redis URL")
+	}
+}
+
+func TestRedisStoreMethodsRejectNilStore(t *testing.T) {
+	var s *RedisStore
+	ctx := context.Background()
+
+	if _, _, err := s.LookupNormalized(ctx, "x"); err == nil {
+		t.Fatal("LookupNormalized on nil store must error")
+	}
+	if _, err := s.Search(ctx, "x", []float64{0.1}, 5); err == nil {
+		t.Fatal("Search on nil store must error")
+	}
+	if err := s.Upsert(ctx, Entry{}); err == nil {
+		t.Fatal("Upsert on nil store must error")
+	}
+	s.Close() // must not panic
+}
+
+func TestRedisStoreValidatesInputsBeforeNetwork(t *testing.T) {
+	// A store with a nil index still validates inputs first, proving the
+	// same validation contract as PostgresStore without needing a server.
+	s := &RedisStore{}
+	ctx := context.Background()
+
+	if _, _, err := s.LookupNormalized(ctx, "   "); err == nil {
+		t.Fatal("LookupNormalized must require a normalized address")
+	}
+	if _, err := s.Search(ctx, "x", nil, 5); err == nil {
+		t.Fatal("Search must require an embedding")
+	}
+	if err := s.Upsert(ctx, Entry{Embedding: []float64{0.1}, Source: SourceCRFPipeline}); err == nil {
+		t.Fatal("Upsert must require a normalized address")
+	}
+	if err := s.Upsert(ctx, Entry{NormalizedAddress: "n", Source: SourceCRFPipeline}); err == nil {
+		t.Fatal("Upsert must require an embedding")
+	}
+	if err := s.Upsert(ctx, Entry{NormalizedAddress: "n", Embedding: []float64{0.1}}); err == nil {
+		t.Fatal("Upsert must require a source")
+	}
+}
+
+func TestRedisIndexSchemaBuildsWithDefaultAndCustomDims(t *testing.T) {
+	if _, err := redisIndexSchema(0); err != nil {
+		t.Fatalf("redisIndexSchema(0) error = %v", err)
+	}
+	if _, err := redisIndexSchema(1536); err != nil {
+		t.Fatalf("redisIndexSchema(1536) error = %v", err)
 	}
 }
