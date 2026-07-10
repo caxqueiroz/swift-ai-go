@@ -15,6 +15,7 @@ import (
 	"github.com/tipmarket/swift-ai/internal/core"
 	"github.com/tipmarket/swift-ai/internal/output"
 	"github.com/tipmarket/swift-ai/internal/pipeline"
+	"github.com/tipmarket/swift-ai/internal/postaldb"
 	"github.com/tipmarket/swift-ai/internal/readers"
 	isoruntime "github.com/tipmarket/swift-ai/internal/runtime"
 )
@@ -22,13 +23,19 @@ import (
 const version = "iso-run dev"
 
 type cliOptions struct {
-	inputPath    string
-	outputPath   string
-	batchSize    int
-	resourcesDir string
-	modelDir     string
-	verbose      bool
-	version      bool
+	inputPath                   string
+	outputPath                  string
+	batchSize                   int
+	resourcesDir                string
+	modelDir                    string
+	postalDBPath                string
+	delimiter                   string
+	addressColumn               string
+	idColumn                    string
+	suggestedCountryColumn      string
+	forceSuggestedCountryColumn string
+	verbose                     bool
+	version                     bool
 }
 
 type outputFormat int
@@ -67,7 +74,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		cfg.CRF.CRFConfigPath = filepath.Join(opts.modelDir, "address_crf.json")
 	}
 
-	readSamples, err := selectReader(opts.inputPath)
+	readSamples, err := selectReaderWithOptions(opts.inputPath, opts)
 	if err != nil {
 		logger.Error("read input", "error", err)
 		return 1
@@ -100,7 +107,14 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		}
 	}()
 
-	results, err := pipeline.New(cfg, &db, modelRunner).Run(ctx, samples)
+	pipelineOpts, closePipelineOpts, err := pipelineOptions(opts)
+	if err != nil {
+		logger.Error("configure pipeline", "error", err)
+		return 1
+	}
+	defer closePipelineOpts()
+
+	results, err := pipeline.New(cfg, &db, modelRunner, pipelineOpts...).Run(ctx, samples)
 	if err != nil {
 		logger.Error("run pipeline", "error", err)
 		return 1
@@ -117,8 +131,13 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 func parseArgs(args []string, stderr io.Writer) (cliOptions, error) {
 	cfg := config.Default()
 	opts := cliOptions{
-		batchSize:    cfg.BatchSize,
-		resourcesDir: cfg.Database.PrefixFolderPath,
+		batchSize:                   cfg.BatchSize,
+		resourcesDir:                cfg.Database.PrefixFolderPath,
+		postalDBPath:                os.Getenv("ISO20022_POSTAL_DB_PATH"),
+		addressColumn:               readers.DefaultAddressColumn,
+		idColumn:                    readers.DefaultIDColumn,
+		suggestedCountryColumn:      readers.DefaultSuggestedCountryColumn,
+		forceSuggestedCountryColumn: readers.DefaultForceSuggestedCountryColumn,
 	}
 
 	fs := flag.NewFlagSet("iso-run", flag.ContinueOnError)
@@ -130,6 +149,12 @@ func parseArgs(args []string, stderr io.Writer) (cliOptions, error) {
 	fs.IntVar(&opts.batchSize, "batch-size", opts.batchSize, "pipeline batch size")
 	fs.StringVar(&opts.resourcesDir, "resources-dir", opts.resourcesDir, "resource directory")
 	fs.StringVar(&opts.modelDir, "model-dir", "", "model artifact directory")
+	fs.StringVar(&opts.postalDBPath, "postal-db", opts.postalDBPath, "optional combined postal location SQLite database path")
+	fs.StringVar(&opts.delimiter, "delimiter", "", "input delimiter override for CSV/TSV: comma, tab, semicolon, pipe, or a single character")
+	fs.StringVar(&opts.addressColumn, "address-column", opts.addressColumn, "input column containing the unstructured address")
+	fs.StringVar(&opts.idColumn, "id-column", opts.idColumn, "optional input column containing a stable row ID")
+	fs.StringVar(&opts.suggestedCountryColumn, "suggested-country-column", opts.suggestedCountryColumn, "optional input column containing an ISO country hint")
+	fs.StringVar(&opts.forceSuggestedCountryColumn, "force-suggested-country-column", opts.forceSuggestedCountryColumn, "optional input column forcing the ISO country hint")
 	fs.BoolVar(&opts.verbose, "verbose", false, "include verbose output")
 	fs.BoolVar(&opts.verbose, "v", false, "include verbose output")
 	fs.BoolVar(&opts.version, "version", false, "print version")
@@ -149,22 +174,82 @@ func parseArgs(args []string, stderr io.Writer) (cliOptions, error) {
 	return opts, nil
 }
 
-func selectReader(path string) (func() ([]core.AddressSample, error), error) {
+func pipelineOptions(opts cliOptions) ([]pipeline.Option, func(), error) {
+	if opts.postalDBPath == "" {
+		return nil, func() {}, nil
+	}
+	runner, err := postaldb.Open(opts.postalDBPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	return []pipeline.Option{pipeline.WithPostcodeRunner(runner)}, func() {
+		_ = runner.Close()
+	}, nil
+}
+
+func selectReaderWithOptions(path string, opts cliOptions) (func() ([]core.AddressSample, error), error) {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".txt":
 		return func() ([]core.AddressSample, error) {
 			return readers.ReadText(path)
 		}, nil
 	case ".csv":
+		comma, err := delimiterForPath(path, opts.delimiter)
+		if err != nil {
+			return nil, err
+		}
 		return func() ([]core.AddressSample, error) {
-			return readers.ReadDelimited(path, ',', readers.DefaultAddressColumn)
+			return readers.ReadDelimitedWithOptions(path, comma, readerOptions(opts))
 		}, nil
 	case ".tsv":
+		comma, err := delimiterForPath(path, opts.delimiter)
+		if err != nil {
+			return nil, err
+		}
 		return func() ([]core.AddressSample, error) {
-			return readers.ReadDelimited(path, '\t', readers.DefaultAddressColumn)
+			return readers.ReadDelimitedWithOptions(path, comma, readerOptions(opts))
 		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported input format %q", filepath.Ext(path))
+	}
+}
+
+func readerOptions(opts cliOptions) readers.DelimitedOptions {
+	return readers.DelimitedOptions{
+		AddressColumn:               opts.addressColumn,
+		IDColumn:                    opts.idColumn,
+		SuggestedCountryColumn:      opts.suggestedCountryColumn,
+		ForceSuggestedCountryColumn: opts.forceSuggestedCountryColumn,
+	}
+}
+
+func delimiterForPath(path, override string) (rune, error) {
+	if override != "" {
+		return parseDelimiter(override)
+	}
+	if strings.EqualFold(filepath.Ext(path), ".tsv") {
+		return '\t', nil
+	}
+	return ',', nil
+}
+
+func parseDelimiter(value string) (rune, error) {
+	trimmed := strings.TrimSpace(value)
+	switch strings.ToLower(trimmed) {
+	case "comma", ",":
+		return ',', nil
+	case "tab", "\\t":
+		return '\t', nil
+	case "semicolon", ";":
+		return ';', nil
+	case "pipe", "|":
+		return '|', nil
+	default:
+		runes := []rune(trimmed)
+		if len(runes) == 1 {
+			return runes[0], nil
+		}
+		return 0, fmt.Errorf("unsupported delimiter %q", value)
 	}
 }
 
