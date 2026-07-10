@@ -75,7 +75,11 @@ func WriteJSON(path string, results []core.Result, verbose bool) error {
 }
 
 func humanReadableColumns(results []core.Result, showInferredCountry bool, verbose bool) []string {
-	columns := []string{"address", "suggested_country", "force_suggested_country"}
+	columns := []string{}
+	if hasResultIDs(results) {
+		columns = append(columns, "id")
+	}
+	columns = append(columns, "address", "suggested_country", "force_suggested_country")
 
 	for i := 1; i <= nBestMatches; i++ {
 		prefix := ordinalPrefix(i)
@@ -113,6 +117,7 @@ func humanReadableColumns(results []core.Result, showInferredCountry bool, verbo
 
 func humanReadableRow(result core.Result, showInferredCountry bool, verbose bool) map[string]string {
 	row := map[string]string{
+		"id":      result.ID,
 		"address": result.CRFResult.Details.Content,
 	}
 	if result.HasSuggestedCountry {
@@ -157,6 +162,15 @@ func humanReadableRow(result core.Result, showInferredCountry bool, verbose bool
 	}
 
 	return row
+}
+
+func hasResultIDs(results []core.Result) bool {
+	for _, result := range results {
+		if result.ID != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func cleanMatched(s string) string {
@@ -209,6 +223,7 @@ func jsonText(v any) string {
 }
 
 type jsonResult struct {
+	ID                    string          `json:"id,omitempty"`
 	CRFResult             jsonCRFResult   `json:"crf_result"`
 	FuzzyResult           jsonFuzzyResult `json:"fuzzy_result"`
 	IBANs                 []string        `json:"ibans"`
@@ -242,6 +257,7 @@ func newJSONResult(result core.Result, verbose bool) jsonResult {
 	}
 
 	return jsonResult{
+		ID:        result.ID,
 		CRFResult: crfResult,
 		FuzzyResult: jsonFuzzyResult{
 			CountryMatches:      result.FuzzyResult.CountryMatches,

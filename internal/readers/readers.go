@@ -12,10 +12,27 @@ import (
 )
 
 const (
+	DefaultIDColumn                    = "id"
 	DefaultAddressColumn               = "address"
 	DefaultSuggestedCountryColumn      = "suggested_country"
 	DefaultForceSuggestedCountryColumn = "force_suggested_country"
 )
+
+type DelimitedOptions struct {
+	AddressColumn               string
+	IDColumn                    string
+	SuggestedCountryColumn      string
+	ForceSuggestedCountryColumn string
+}
+
+func DefaultDelimitedOptions() DelimitedOptions {
+	return DelimitedOptions{
+		AddressColumn:               DefaultAddressColumn,
+		IDColumn:                    DefaultIDColumn,
+		SuggestedCountryColumn:      DefaultSuggestedCountryColumn,
+		ForceSuggestedCountryColumn: DefaultForceSuggestedCountryColumn,
+	}
+}
 
 func ReadText(path string) ([]core.AddressSample, error) {
 	file, err := os.Open(path)
@@ -49,6 +66,13 @@ func ReadText(path string) ([]core.AddressSample, error) {
 }
 
 func ReadDelimited(path string, comma rune, addressColumn string) ([]core.AddressSample, error) {
+	opts := DefaultDelimitedOptions()
+	opts.AddressColumn = addressColumn
+	return ReadDelimitedWithOptions(path, comma, opts)
+}
+
+func ReadDelimitedWithOptions(path string, comma rune, opts DelimitedOptions) ([]core.AddressSample, error) {
+	opts = normalizeDelimitedOptions(opts)
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open delimited file %q: %w", path, err)
@@ -63,18 +87,19 @@ func ReadDelimited(path string, comma rune, addressColumn string) ([]core.Addres
 
 	header, err := reader.Read()
 	if err == io.EOF {
-		return nil, columnNotFoundError(path, addressColumn)
+		return nil, columnNotFoundError(path, opts.AddressColumn)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("read header from delimited file %q: %w", path, err)
 	}
 
-	addressIndex := columnIndex(header, addressColumn)
+	addressIndex := columnIndex(header, opts.AddressColumn)
 	if addressIndex < 0 {
-		return nil, columnNotFoundError(path, addressColumn)
+		return nil, columnNotFoundError(path, opts.AddressColumn)
 	}
-	suggestedCountryIndex := columnIndex(header, DefaultSuggestedCountryColumn)
-	forceSuggestedCountryIndex := columnIndex(header, DefaultForceSuggestedCountryColumn)
+	idIndex := columnIndex(header, opts.IDColumn)
+	suggestedCountryIndex := columnIndex(header, opts.SuggestedCountryColumn)
+	forceSuggestedCountryIndex := columnIndex(header, opts.ForceSuggestedCountryColumn)
 
 	var samples []core.AddressSample
 	for {
@@ -90,6 +115,9 @@ func ReadDelimited(path string, comma rune, addressColumn string) ([]core.Addres
 		}
 
 		sample := core.AddressSample{Text: record[addressIndex]}
+		if idIndex >= 0 && idIndex < len(record) {
+			sample.ID = strings.TrimSpace(record[idIndex])
+		}
 		if suggestedCountryIndex >= 0 && suggestedCountryIndex < len(record) {
 			suggestedCountry := strings.ToUpper(strings.TrimSpace(record[suggestedCountryIndex]))
 			if suggestedCountry != "" {
@@ -106,6 +134,23 @@ func ReadDelimited(path string, comma rune, addressColumn string) ([]core.Addres
 	return samples, nil
 }
 
+func normalizeDelimitedOptions(opts DelimitedOptions) DelimitedOptions {
+	defaults := DefaultDelimitedOptions()
+	if opts.AddressColumn == "" {
+		opts.AddressColumn = defaults.AddressColumn
+	}
+	if opts.IDColumn == "" {
+		opts.IDColumn = defaults.IDColumn
+	}
+	if opts.SuggestedCountryColumn == "" {
+		opts.SuggestedCountryColumn = defaults.SuggestedCountryColumn
+	}
+	if opts.ForceSuggestedCountryColumn == "" {
+		opts.ForceSuggestedCountryColumn = defaults.ForceSuggestedCountryColumn
+	}
+	return opts
+}
+
 func columnNotFoundError(path, column string) error {
 	return fmt.Errorf("read delimited file %q: Column '%s' not found", path, column)
 }
@@ -115,7 +160,7 @@ func columnIndex(header []string, column string) int {
 		if i == 0 {
 			name = strings.TrimPrefix(name, "\ufeff")
 		}
-		if strings.TrimSpace(name) == column {
+		if strings.EqualFold(strings.TrimSpace(name), strings.TrimSpace(column)) {
 			return i
 		}
 	}
