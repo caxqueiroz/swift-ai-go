@@ -174,6 +174,9 @@ ISO20022_ONNX_RUNTIME=$PWD/.onnxruntime/onnxruntime-osx-arm64-1.26.0/lib/libonnx
   --model-dir resources/models \
   --high-confidence-threshold 0.99 \
   --medium-confidence-threshold 0.80 \
+  --holdout-mod 10 \
+  --holdout-min-bucket 0 \
+  --holdout-max-bucket 8 \
   --review-path /tmp/address-review-cl.json
 ```
 
@@ -327,8 +330,13 @@ task eval:dataaddr-client \
   COUNTRY=CL \
   LIMIT=1000 \
   BATCH_SIZE=10 \
+  TIMEOUT=0 \
+  REQUEST_TIMEOUT=10m \
   INPUT_MODE=address-town-country \
-  MISMATCHES=/tmp/convert-mismatches-cl.jsonl
+  LOG_ALL=1 \
+  HOLDOUT_MOD=10 \
+  HOLDOUT_MIN_BUCKET=8 \
+  MISMATCHES=/tmp/convert-rows-cl.jsonl
 ```
 
 Equivalent direct command:
@@ -340,8 +348,13 @@ go run ./examples/client \
   --country CL \
   --limit 1000 \
   --batch-size 10 \
+  --timeout 0 \
+  --request-timeout 10m \
   --input-mode address-town-country \
-  --mismatches /tmp/convert-mismatches-cl.jsonl
+  --log-all \
+  --holdout-mod 10 \
+  --holdout-min-bucket 8 \
+  --mismatches /tmp/convert-rows-cl.jsonl
 ```
 
 ### Interpreting Results
@@ -356,15 +369,20 @@ The evaluator prints JSON:
   "metrics": {
     "country_accuracy": 1,
     "town_accuracy": 0.7,
-    "both_accuracy": 0.7
+    "both_accuracy": 0.7,
+    "coverage": 0.4,
+    "precision_at_committed_both": 1,
+    "precision_at_committed_country": 1
   }
 }
 ```
 
-Mismatch JSONL rows include enough context for review:
+The evaluator treats only `resolution_status=resolved` and `confidence_band=high` as committed. `coverage` is committed rows divided by sampled rows, and `precision_at_committed_*` is computed only over committed rows.
+
+JSONL rows include enough context for review. By default only mismatches are written; add `--log-all` to write every evaluated row:
 
 ```json
-{"id":"...","address":"6 LAS GAVIOTAS\nCURACO DE VELEZ\nCL","expected_country":"CL","expected_town":"CURACO DE VELEZ","actual_country":"CL","actual_town":"CURACO","status":"needs_review","band":"medium"}
+{"id":"...","address":"6 LAS GAVIOTAS\nCURACO DE VELEZ\nCL","input_mode":"address-town-country","expected_country":"CL","expected_town":"CURACO DE VELEZ","actual_country":"CL","actual_town":"CURACO","status":"needs_review","band":"medium"}
 ```
 
 Country mismatch is usually a strong signal. Town mismatch is a review signal because DataAddr `town` may not always use the same locality concept as GeoNames.
@@ -383,7 +401,33 @@ Recommended split:
   holdout evaluation
 ```
 
-At minimum, keep a deterministic holdout by country and town stratum using the evaluator seed. A future improvement should make `iso-cache-fill` and `examples/client` share an explicit holdout manifest.
+Use deterministic ID buckets for resolver and cache holdouts:
+
+```text
+cache-fill:  stable_hash(address_id) % 10 in [0, 8)
+eval:        stable_hash(address_id) % 10 in [8, 10)
+```
+
+The evaluator side is:
+
+```bash
+task eval:dataaddr-client \
+  COUNTRY=CL LIMIT=1000 INPUT_MODE=address \
+  TIMEOUT=0 REQUEST_TIMEOUT=10m LOG_ALL=1 HOLDOUT_MOD=10 HOLDOUT_MIN_BUCKET=8 \
+  MISMATCHES=/tmp/convert-rows-cl.jsonl
+```
+
+For cache fill, use the complementary buckets:
+
+```bash
+task cache-fill:dataaddr-local \
+  COUNTRY=CL \
+  HOLDOUT_MOD=10 \
+  HOLDOUT_MIN_BUCKET=0 \
+  HOLDOUT_MAX_BUCKET=8
+```
+
+`iso-cache-fill` uses the sample `id` column for the bucket key when present, and falls back to the input text for sources that do not carry IDs. A future improvement should make `iso-cache-fill` and `examples/client` share an explicit holdout manifest.
 
 ## Current Observations
 

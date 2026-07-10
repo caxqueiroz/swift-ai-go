@@ -76,13 +76,22 @@ go run ./examples/client \
   --api-url http://localhost:8080/convert \
   --country SG \
   --limit 1000 \
-  --mismatches /tmp/convert-mismatches-sg.jsonl
+  --input-mode address \
+  --log-all \
+  --holdout-mod 10 \
+  --holdout-min-bucket 8 \
+  --mismatches /tmp/convert-rows-sg.jsonl
 ```
 
 Or use Task:
 
 ```bash
-task eval:dataaddr-client COUNTRY=SG LIMIT=1000 MISMATCHES=/tmp/convert-mismatches-sg.jsonl
+task eval:dataaddr-client \
+  COUNTRY=SG LIMIT=1000 INPUT_MODE=address \
+  TIMEOUT=0 REQUEST_TIMEOUT=10m LOG_ALL=1 HOLDOUT_MOD=10 HOLDOUT_MIN_BUCKET=8 \
+  MISMATCHES=/tmp/convert-rows-sg.jsonl
 ```
+
+The JSON summary includes raw accuracy, coverage, and precision among committed rows (`resolution_status=resolved` and `confidence_band=high`). With `--log-all`, the JSONL path contains every evaluated row; without it, the path contains only mismatches.
 
 Run the API with `DATABASE_URL` only when measuring cache behavior. If the same SQLite rows were used to build the cache, keep a holdout sample for evaluation; otherwise the test measures cache lookup, not resolver quality.

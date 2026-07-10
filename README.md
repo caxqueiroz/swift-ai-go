@@ -413,8 +413,13 @@ go run ./cmd/iso-api --resources-dir resources --model-dir resources/models
 Then run a stratified sample:
 
 ```bash
-task eval:dataaddr-client COUNTRY=SG LIMIT=1000 MISMATCHES=/tmp/convert-mismatches-sg.jsonl
+task eval:dataaddr-client \
+  COUNTRY=SG LIMIT=1000 INPUT_MODE=address \
+  TIMEOUT=0 REQUEST_TIMEOUT=10m LOG_ALL=1 HOLDOUT_MOD=10 HOLDOUT_MIN_BUCKET=8 \
+  MISMATCHES=/tmp/convert-rows-sg.jsonl
 ```
+
+The evaluator reports raw accuracy, coverage, and precision among committed rows (`resolution_status=resolved` and `confidence_band=high`). `LOG_ALL=1` writes every evaluated row to JSONL; otherwise only mismatches are written.
 
 For cache behavior, run the API with `DATABASE_URL`. Keep a holdout sample out of cache-fill; testing on rows already cached from the same SQLite source measures cache lookup, not resolver correctness.
 
