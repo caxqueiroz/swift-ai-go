@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"database/sql"
+	"os"
+	"path/filepath"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -50,6 +52,46 @@ func TestFetchAddressAtPlanOffset(t *testing.T) {
 	}
 	if record.ID != "2" || record.Address != "2 PARK STREET" || record.Town != "Singapore" || record.Country != "SG" {
 		t.Fatalf("record = %#v, want second Singapore row", record)
+	}
+}
+
+func TestResolveCountrySQLitePathUsesSiblingCountryShard(t *testing.T) {
+	root := t.TempDir()
+	aggregate := filepath.Join(root, "addresses.sqlite")
+	shardDir := filepath.Join(root, "address_shards")
+	shard := filepath.Join(shardDir, "cl.sqlite")
+	if err := os.WriteFile(aggregate, []byte("aggregate"), 0o644); err != nil {
+		t.Fatalf("write aggregate: %v", err)
+	}
+	if err := os.MkdirAll(shardDir, 0o755); err != nil {
+		t.Fatalf("create shard dir: %v", err)
+	}
+	if err := os.WriteFile(shard, []byte("shard"), 0o644); err != nil {
+		t.Fatalf("write shard: %v", err)
+	}
+
+	got, err := resolveCountrySQLitePath(aggregate, "CL")
+	if err != nil {
+		t.Fatalf("resolveCountrySQLitePath() error = %v", err)
+	}
+	if got != shard {
+		t.Fatalf("resolved path = %q, want %q", got, shard)
+	}
+}
+
+func TestResolveCountrySQLitePathKeepsOriginalWhenShardMissing(t *testing.T) {
+	root := t.TempDir()
+	aggregate := filepath.Join(root, "addresses.sqlite")
+	if err := os.WriteFile(aggregate, []byte("aggregate"), 0o644); err != nil {
+		t.Fatalf("write aggregate: %v", err)
+	}
+
+	got, err := resolveCountrySQLitePath(aggregate, "CL")
+	if err != nil {
+		t.Fatalf("resolveCountrySQLitePath() error = %v", err)
+	}
+	if got != aggregate {
+		t.Fatalf("resolved path = %q, want original %q", got, aggregate)
 	}
 }
 

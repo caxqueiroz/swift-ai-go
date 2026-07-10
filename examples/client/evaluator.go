@@ -6,6 +6,7 @@ import (
 	"unicode"
 
 	"github.com/mozillazg/go-unidecode"
+	"github.com/tipmarket/swift-ai/internal/holdout"
 )
 
 const (
@@ -97,16 +98,29 @@ func stratumName(country string, count int) string {
 }
 
 type evaluationRow struct {
-	ID              string `json:"id,omitempty"`
-	Address         string `json:"address,omitempty"`
-	Stratum         string `json:"stratum"`
-	ExpectedCountry string `json:"expected_country"`
-	ExpectedTown    string `json:"expected_town"`
-	ActualCountry   string `json:"actual_country"`
-	ActualTown      string `json:"actual_town"`
-	ServedBy        string `json:"served_by,omitempty"`
-	Status          string `json:"status,omitempty"`
-	Band            string `json:"band,omitempty"`
+	ID                       string  `json:"id,omitempty"`
+	Address                  string  `json:"address,omitempty"`
+	InputMode                string  `json:"input_mode,omitempty"`
+	Stratum                  string  `json:"stratum"`
+	ExpectedCountry          string  `json:"expected_country"`
+	ExpectedCountryCanonical string  `json:"expected_country_canonical"`
+	ExpectedTown             string  `json:"expected_town"`
+	ExpectedTownCanonical    string  `json:"expected_town_canonical"`
+	ActualCountry            string  `json:"actual_country"`
+	ActualCountryCanonical   string  `json:"actual_country_canonical"`
+	ActualTown               string  `json:"actual_town"`
+	ActualTownCanonical      string  `json:"actual_town_canonical"`
+	CountryCorrect           bool    `json:"country_correct"`
+	TownCorrect              bool    `json:"town_correct"`
+	BothCorrect              bool    `json:"both_correct"`
+	Committed                bool    `json:"committed"`
+	ActualCountryConfidence  float64 `json:"actual_country_confidence,omitempty"`
+	ActualTownConfidence     float64 `json:"actual_town_confidence,omitempty"`
+	ServedBy                 string  `json:"served_by,omitempty"`
+	Status                   string  `json:"status,omitempty"`
+	Band                     string  `json:"band,omitempty"`
+	QualityScore             float64 `json:"quality_score,omitempty"`
+	QualityReason            string  `json:"quality_reason,omitempty"`
 }
 
 type metricRecorder struct {
@@ -120,13 +134,22 @@ type metricReport struct {
 }
 
 type metricSummary struct {
-	Total           int     `json:"total"`
-	CountryCorrect  int     `json:"country_correct"`
-	TownCorrect     int     `json:"town_correct"`
-	BothCorrect     int     `json:"both_correct"`
-	CountryAccuracy float64 `json:"country_accuracy"`
-	TownAccuracy    float64 `json:"town_accuracy"`
-	BothAccuracy    float64 `json:"both_accuracy"`
+	Total                       int     `json:"total"`
+	CountryCorrect              int     `json:"country_correct"`
+	TownCorrect                 int     `json:"town_correct"`
+	BothCorrect                 int     `json:"both_correct"`
+	Committed                   int     `json:"committed"`
+	CommittedCountryCorrect     int     `json:"committed_country_correct"`
+	CommittedTownCorrect        int     `json:"committed_town_correct"`
+	CommittedBothCorrect        int     `json:"committed_both_correct"`
+	CountryAccuracy             float64 `json:"country_accuracy"`
+	TownAccuracy                float64 `json:"town_accuracy"`
+	BothAccuracy                float64 `json:"both_accuracy"`
+	Coverage                    float64 `json:"coverage"`
+	PrecisionAtCommittedCountry float64 `json:"precision_at_committed_country"`
+	PrecisionAtCommittedTown    float64 `json:"precision_at_committed_town"`
+	PrecisionAtCommittedBoth    float64 `json:"precision_at_committed_both"`
+	FalsePositiveRateCommitted  float64 `json:"false_positive_rate_committed"`
 }
 
 func newMetricRecorder() *metricRecorder {
@@ -134,9 +157,11 @@ func newMetricRecorder() *metricRecorder {
 }
 
 func (r *metricRecorder) Add(row evaluationRow) {
-	countryOK := canonicalCountry(row.ExpectedCountry) == canonicalCountry(row.ActualCountry)
-	townOK := canonicalTown(row.ExpectedTown) == canonicalTown(row.ActualTown)
-	r.addTo(&r.overall, countryOK, townOK)
+	row = finalizeEvaluationRow(row)
+	countryOK := row.CountryCorrect
+	townOK := row.TownCorrect
+	committed := row.Committed
+	r.addTo(&r.overall, countryOK, townOK, committed)
 	stratum := row.Stratum
 	if stratum == "" {
 		stratum = "unknown"
@@ -144,10 +169,10 @@ func (r *metricRecorder) Add(row evaluationRow) {
 	if r.strata[stratum] == nil {
 		r.strata[stratum] = &metricSummary{}
 	}
-	r.addTo(r.strata[stratum], countryOK, townOK)
+	r.addTo(r.strata[stratum], countryOK, townOK, committed)
 }
 
-func (r *metricRecorder) addTo(summary *metricSummary, countryOK bool, townOK bool) {
+func (r *metricRecorder) addTo(summary *metricSummary, countryOK bool, townOK bool, committed bool) {
 	summary.Total++
 	if countryOK {
 		summary.CountryCorrect++
@@ -157,6 +182,18 @@ func (r *metricRecorder) addTo(summary *metricSummary, countryOK bool, townOK bo
 	}
 	if countryOK && townOK {
 		summary.BothCorrect++
+	}
+	if committed {
+		summary.Committed++
+		if countryOK {
+			summary.CommittedCountryCorrect++
+		}
+		if townOK {
+			summary.CommittedTownCorrect++
+		}
+		if countryOK && townOK {
+			summary.CommittedBothCorrect++
+		}
 	}
 	refreshRates(summary)
 }
@@ -178,6 +215,15 @@ func refreshRates(summary *metricSummary) {
 	summary.CountryAccuracy = float64(summary.CountryCorrect) / total
 	summary.TownAccuracy = float64(summary.TownCorrect) / total
 	summary.BothAccuracy = float64(summary.BothCorrect) / total
+	summary.Coverage = float64(summary.Committed) / total
+	if summary.Committed == 0 {
+		return
+	}
+	committed := float64(summary.Committed)
+	summary.PrecisionAtCommittedCountry = float64(summary.CommittedCountryCorrect) / committed
+	summary.PrecisionAtCommittedTown = float64(summary.CommittedTownCorrect) / committed
+	summary.PrecisionAtCommittedBoth = float64(summary.CommittedBothCorrect) / committed
+	summary.FalsePositiveRateCommitted = 1 - summary.PrecisionAtCommittedBoth
 }
 
 func canonicalCountry(country string) string {
@@ -204,8 +250,46 @@ func canonicalTown(town string) string {
 }
 
 func isMismatch(row evaluationRow) bool {
-	return canonicalCountry(row.ExpectedCountry) != canonicalCountry(row.ActualCountry) ||
-		canonicalTown(row.ExpectedTown) != canonicalTown(row.ActualTown)
+	row = finalizeEvaluationRow(row)
+	return !row.BothCorrect
+}
+
+func isCommitted(row evaluationRow) bool {
+	return strings.EqualFold(strings.TrimSpace(row.Status), "resolved") &&
+		strings.EqualFold(strings.TrimSpace(row.Band), "high")
+}
+
+func finalizeEvaluationRow(row evaluationRow) evaluationRow {
+	row.ExpectedCountryCanonical = canonicalCountry(row.ExpectedCountry)
+	row.ActualCountryCanonical = canonicalCountry(row.ActualCountry)
+	row.ExpectedTownCanonical = canonicalTown(row.ExpectedTown)
+	row.ActualTownCanonical = canonicalTown(row.ActualTown)
+	row.CountryCorrect = row.ExpectedCountryCanonical == row.ActualCountryCanonical
+	row.TownCorrect = row.ExpectedTownCanonical == row.ActualTownCanonical
+	row.BothCorrect = row.CountryCorrect && row.TownCorrect
+	row.Committed = isCommitted(row)
+	return row
+}
+
+func shouldLogRow(row evaluationRow, logAll bool) bool {
+	return logAll || isMismatch(row)
+}
+
+func applyHoldoutFilter(records []addressRecord, filter holdout.Filter, limit int) []addressRecord {
+	if !filter.Enabled() {
+		return records
+	}
+	filtered := make([]addressRecord, 0, min(len(records), limit))
+	for _, record := range records {
+		if !filter.Include(record.ID) {
+			continue
+		}
+		filtered = append(filtered, record)
+		if limit > 0 && len(filtered) >= limit {
+			break
+		}
+	}
+	return filtered
 }
 
 func buildInputText(record addressRecord, mode string) string {

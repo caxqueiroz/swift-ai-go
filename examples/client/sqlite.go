@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	_ "modernc.org/sqlite"
@@ -31,6 +33,25 @@ func openSQLite(path string) (*sql.DB, error) {
 		return nil, fmt.Errorf("ping sqlite %q: %w", path, err)
 	}
 	return db, nil
+}
+
+func resolveCountrySQLitePath(path string, countryFilter string) (string, error) {
+	country := strings.ToLower(canonicalCountry(countryFilter))
+	if country == "" {
+		return path, nil
+	}
+	shard := filepath.Join(filepath.Dir(path), "address_shards", country+".sqlite")
+	info, err := os.Stat(shard)
+	switch {
+	case err == nil && !info.IsDir():
+		return shard, nil
+	case err == nil:
+		return path, nil
+	case errors.Is(err, os.ErrNotExist):
+		return path, nil
+	default:
+		return "", fmt.Errorf("stat country shard %q: %w", shard, err)
+	}
 }
 
 func loadTownGroups(ctx context.Context, db *sql.DB, countryFilter string, includeBlankTown bool) ([]townGroup, error) {

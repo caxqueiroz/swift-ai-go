@@ -27,11 +27,15 @@ type convertItem struct {
 	ServedBy         string            `json:"served_by"`
 	ResolutionStatus string            `json:"resolution_status"`
 	ConfidenceBand   string            `json:"confidence_band"`
+	QualityScore     float64           `json:"quality_score"`
+	QualityReason    string            `json:"quality_reason"`
 }
 
 type structuredAddress struct {
-	Country string `json:"country"`
-	Town    string `json:"town"`
+	Country           string  `json:"country"`
+	Town              string  `json:"town"`
+	CountryConfidence float64 `json:"country_confidence"`
+	TownConfidence    float64 `json:"town_confidence"`
 }
 
 func convertBatch(ctx context.Context, client *http.Client, apiURL string, records []addressRecord, inputMode string) ([]evaluationRow, error) {
@@ -78,18 +82,23 @@ func convertBatch(ctx context.Context, client *http.Client, apiURL string, recor
 	rows := make([]evaluationRow, len(records))
 	for i, item := range payload.Items {
 		record := records[i]
-		rows[i] = evaluationRow{
-			ID:              record.ID,
-			Address:         buildInputText(record, inputMode),
-			Stratum:         record.Stratum,
-			ExpectedCountry: record.Country,
-			ExpectedTown:    record.Town,
-			ActualCountry:   item.Structured.Country,
-			ActualTown:      item.Structured.Town,
-			ServedBy:        item.ServedBy,
-			Status:          item.ResolutionStatus,
-			Band:            item.ConfidenceBand,
-		}
+		rows[i] = finalizeEvaluationRow(evaluationRow{
+			ID:                      record.ID,
+			Address:                 buildInputText(record, inputMode),
+			InputMode:               inputMode,
+			Stratum:                 record.Stratum,
+			ExpectedCountry:         record.Country,
+			ExpectedTown:            record.Town,
+			ActualCountry:           item.Structured.Country,
+			ActualTown:              item.Structured.Town,
+			ActualCountryConfidence: item.Structured.CountryConfidence,
+			ActualTownConfidence:    item.Structured.TownConfidence,
+			ServedBy:                item.ServedBy,
+			Status:                  item.ResolutionStatus,
+			Band:                    item.ConfidenceBand,
+			QualityScore:            item.QualityScore,
+			QualityReason:           item.QualityReason,
+		})
 	}
 	return rows, nil
 }
