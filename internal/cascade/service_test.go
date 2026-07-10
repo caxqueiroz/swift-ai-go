@@ -63,6 +63,9 @@ func TestConvertUsesTrustedExactCacheHitWithoutEmbedding(t *testing.T) {
 	if got[0].ResolutionStatus != quality.StatusResolved || got[0].ConfidenceBand != quality.BandHigh {
 		t.Fatalf("quality = %q/%q, want resolved/high", got[0].ResolutionStatus, got[0].ConfidenceBand)
 	}
+	if got[0].QualityScore != 0.97 || got[0].QualityReason != quality.ReasonHighConfidence {
+		t.Fatalf("quality diagnostics = %f/%q, want 0.97/%q", got[0].QualityScore, got[0].QualityReason, quality.ReasonHighConfidence)
+	}
 }
 
 func TestConvertUsesTrustedSemanticCacheHitAfterExactMiss(t *testing.T) {
