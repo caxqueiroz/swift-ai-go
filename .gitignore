@@ -12,3 +12,7 @@ __pycache__/
 # Downloaded/generated model and reference data
 resources/
 .onnxruntime/
+/iso-api
+
+# IDE
+.idea/
