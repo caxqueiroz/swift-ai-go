@@ -97,15 +97,17 @@ func (r Runner) runOne(crf core.CRFResult, fuzzy core.FuzzyResult, postcodes []c
 		crf,
 	)
 	addPostcodeTownFlags(processed.TownMatches, postcodes)
+	addPostcodeCountryFlags(processed.CountryMatches, postcodes)
 
 	processed.CountryMatches = r.computeCountryScores(processed.CountryMatches)
 	processed.TownMatches = r.computeTownScores(processed.TownMatches)
 
-	countryMatches, townMatches := r.finalMatches(processed.CountryMatches, processed.TownMatches, sample)
+	countryMatches, townMatches := r.finalMatches(processed.CountryMatches, processed.TownMatches, sample, text)
 	processed.CountryMatches = countryMatches
 	processed.TownMatches = townMatches
 
 	return core.Result{
+		ID:                    sample.ID,
 		CRFResult:             crf,
 		FuzzyResult:           processed,
 		IBANs:                 ibans,
@@ -166,11 +168,12 @@ func (r Runner) computeTownScores(matches []core.FuzzyMatch) []core.FuzzyMatch {
 	return scored
 }
 
-func (r Runner) finalMatches(countries, towns []core.FuzzyMatch, sample core.AddressSample) ([]core.FuzzyMatch, []core.FuzzyMatch) {
+func (r Runner) finalMatches(countries, towns []core.FuzzyMatch, sample core.AddressSample, text string) ([]core.FuzzyMatch, []core.FuzzyMatch) {
 	countryThreshold := r.cfg.PostProcessing.MinimalFinalScoreCountry
 	townThreshold := r.cfg.PostProcessing.MinimalFinalScoreTown
 	countries = matchesAboveThreshold(countries, countryThreshold)
 	towns = matchesAboveThreshold(towns, townThreshold)
+	towns = addPenultimateLineTownFallback(text, countries, towns)
 
 	noCountryScore := r.cfg.PostProcessing.MinimalFinalScoreCountry
 	if sample.HasSuggestedCountry && sample.SuggestedCountry == "NO COUNTRY" {
@@ -202,6 +205,7 @@ func (r Runner) finalMatches(countries, towns []core.FuzzyMatch, sample core.Add
 	generator.SetSuggestedCountry(sample.SuggestedCountry, sample.HasSuggestedCountry)
 	generator.SetForceSuggestedCountry(sample.ForceSuggestedCountry)
 	combinations := generator.Generate(countries, towns, noCountry, noTown)
+	combinations = rerankCombinationsForLineStructure(text, combinations)
 
 	finalCountries := make([]core.FuzzyMatch, 0, len(combinations))
 	finalTowns := make([]core.FuzzyMatch, 0, len(combinations))
@@ -401,6 +405,19 @@ func addPostcodeTownFlags(towns []core.FuzzyMatch, postcodes []core.PostcodeMatc
 	}
 }
 
+func addPostcodeCountryFlags(countries []core.FuzzyMatch, postcodes []core.PostcodeMatch) {
+	for _, postcode := range postcodes {
+		if postcode.Matched == "" || postcode.Origin == "" {
+			continue
+		}
+		for i := range countries {
+			if countries[i].Origin == postcode.Origin {
+				addFlag(&countries[i], core.FlagPostalCodeIsPresent)
+			}
+		}
+	}
+}
+
 func findIBANs(pattern string, text string) ([]string, error) {
 	re, err := regexp.Compile(pattern)
 	if err != nil {
@@ -434,6 +451,9 @@ func unwrapPositiveLookaheadCapture(pattern string) string {
 }
 
 func addPostcodeFlagIfMatched(match *core.FuzzyMatch, postcode core.PostcodeMatch) {
+	if postcode.Possibility == "" {
+		return
+	}
 	if postcode.Origin != match.Origin {
 		return
 	}
