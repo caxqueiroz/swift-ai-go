@@ -19,6 +19,7 @@ import (
 	"github.com/tipmarket/swift-ai/internal/config"
 	"github.com/tipmarket/swift-ai/internal/embedding"
 	"github.com/tipmarket/swift-ai/internal/pipeline"
+	"github.com/tipmarket/swift-ai/internal/postaldb"
 	"github.com/tipmarket/swift-ai/internal/quality"
 	isoruntime "github.com/tipmarket/swift-ai/internal/runtime"
 )
@@ -28,6 +29,8 @@ type options struct {
 	resourcesDir              string
 	modelDir                  string
 	databaseURL               string
+	cacheBackend              string
+	redisURL                  string
 	embeddingAPIKey           string
 	embeddingBaseURL          string
 	embeddingModel            string
@@ -36,6 +39,7 @@ type options struct {
 	embeddingModelPath        string
 	embeddingVocabPath        string
 	embeddingMaxSequenceLen   int
+	postalDBPath              string
 	batchSize                 int
 	semanticThreshold         float64
 	lexicalThreshold          float64
@@ -108,7 +112,14 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		logger.Warn("stage1 semantic cache disabled; serving through stage2 pipeline")
 	}
 
-	converter := cascade.NewService(pipeline.New(cfg, &db, modelRunner), cascadeOpts...)
+	pipelineOpts, closePipelineOpts, err := pipelineOptions(opts)
+	if err != nil {
+		logger.Error("configure pipeline", "error", err)
+		return 1
+	}
+	defer closePipelineOpts()
+
+	converter := cascade.NewService(pipeline.New(cfg, &db, modelRunner, pipelineOpts...), cascadeOpts...)
 	mux := http.NewServeMux()
 	mux.Handle("/convert", api.NewHandler(converter, logger))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -138,6 +149,8 @@ func parseArgs(args []string, stderr io.Writer) (options, error) {
 		addr:                      defaultAddr(),
 		resourcesDir:              envDefault("ISO20022_RESOURCES_DIR", cfg.Database.PrefixFolderPath),
 		databaseURL:               os.Getenv("DATABASE_URL"),
+		cacheBackend:              envDefault("CACHE_BACKEND", cache.BackendPgvector),
+		redisURL:                  os.Getenv("REDIS_URL"),
 		embeddingAPIKey:           os.Getenv("OPENAI_API_KEY"),
 		embeddingBaseURL:          envDefault("OPENAI_BASE_URL", "https://api.openai.com/v1"),
 		embeddingModel:            os.Getenv("EMBEDDING_MODEL"),
@@ -145,6 +158,7 @@ func parseArgs(args []string, stderr io.Writer) (options, error) {
 		embeddingModelPath:        envDefault("EMBEDDING_MODEL_PATH", embedding.DefaultLocalModelPath),
 		embeddingVocabPath:        envDefault("EMBEDDING_VOCAB_PATH", embedding.DefaultLocalVocabPath),
 		embeddingMaxSequenceLen:   embedding.DefaultLocalMaxSequenceLength,
+		postalDBPath:              os.Getenv("ISO20022_POSTAL_DB_PATH"),
 		batchSize:                 cfg.BatchSize,
 		semanticThreshold:         0.90,
 		lexicalThreshold:          0.85,
@@ -173,6 +187,8 @@ func parseArgs(args []string, stderr io.Writer) (options, error) {
 	fs.StringVar(&opts.resourcesDir, "resources-dir", opts.resourcesDir, "resource directory")
 	fs.StringVar(&opts.modelDir, "model-dir", "", "model artifact directory")
 	fs.StringVar(&opts.databaseURL, "database-url", opts.databaseURL, "Postgres connection string for semantic cache")
+	fs.StringVar(&opts.cacheBackend, "cache-backend", opts.cacheBackend, "semantic cache backend: pgvector or redis")
+	fs.StringVar(&opts.redisURL, "redis-url", opts.redisURL, "Redis connection URL for the redis cache backend")
 	fs.StringVar(&opts.embeddingAPIKey, "embedding-api-key", opts.embeddingAPIKey, "OpenAI-compatible embedding API key")
 	fs.StringVar(&opts.embeddingBaseURL, "embedding-base-url", opts.embeddingBaseURL, "OpenAI-compatible base URL")
 	fs.StringVar(&opts.embeddingModel, "embedding-model", opts.embeddingModel, "embedding model name")
@@ -181,6 +197,7 @@ func parseArgs(args []string, stderr io.Writer) (options, error) {
 	fs.StringVar(&opts.embeddingModelPath, "embedding-model-path", opts.embeddingModelPath, "local ONNX embedding model path")
 	fs.StringVar(&opts.embeddingVocabPath, "embedding-vocab-path", opts.embeddingVocabPath, "local embedding vocab.txt path")
 	fs.IntVar(&opts.embeddingMaxSequenceLen, "embedding-max-sequence-length", opts.embeddingMaxSequenceLen, "local embedding max sequence length")
+	fs.StringVar(&opts.postalDBPath, "postal-db", opts.postalDBPath, "optional combined postal location SQLite database path")
 	fs.Float64Var(&opts.semanticThreshold, "semantic-threshold", opts.semanticThreshold, "minimum cosine similarity for Stage 1")
 	fs.Float64Var(&opts.lexicalThreshold, "lexical-threshold", opts.lexicalThreshold, "minimum lexical identity for Stage 1")
 	fs.Float64Var(&opts.highConfidenceThreshold, "high-confidence-threshold", opts.highConfidenceThreshold, "minimum country/town confidence for resolved status")
@@ -193,18 +210,36 @@ func parseArgs(args []string, stderr io.Writer) (options, error) {
 	return opts, nil
 }
 
-func stage1Dependencies(ctx context.Context, opts options) (cache.Store, cascade.Embedder, func(), error) {
-	if opts.databaseURL == "" {
-		return nil, nil, func() {}, nil
+func pipelineOptions(opts options) ([]pipeline.Option, func(), error) {
+	if opts.postalDBPath == "" {
+		return nil, func() {}, nil
 	}
-	store, err := cache.NewPostgresStore(ctx, opts.databaseURL)
+	runner, err := postaldb.Open(opts.postalDBPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	return []pipeline.Option{pipeline.WithPostcodeRunner(runner)}, func() {
+		_ = runner.Close()
+	}, nil
+}
+
+func stage1Dependencies(ctx context.Context, opts options) (cache.Store, cascade.Embedder, func(), error) {
+	store, closeStore, err := cache.OpenStore(ctx, cache.Config{
+		Backend:     opts.cacheBackend,
+		DatabaseURL: opts.databaseURL,
+		RedisURL:    opts.redisURL,
+		Dimensions:  opts.embeddingDimensions,
+	})
 	if err != nil {
 		return nil, nil, func() {}, err
+	}
+	if store == nil {
+		return nil, nil, func() {}, nil
 	}
 	switch opts.embeddingBackend {
 	case "openai", "http":
 		if opts.embeddingModel == "" {
-			store.Close()
+			closeStore()
 			return nil, nil, func() {}, errors.New("embedding model is required for openai embedding backend")
 		}
 		embedder, err := embedding.NewOpenAICompatible(embedding.Config{
@@ -214,10 +249,10 @@ func stage1Dependencies(ctx context.Context, opts options) (cache.Store, cascade
 			Dimensions: opts.embeddingDimensions,
 		})
 		if err != nil {
-			store.Close()
+			closeStore()
 			return nil, nil, func() {}, err
 		}
-		return store, embedder, store.Close, nil
+		return store, embedder, closeStore, nil
 	case "onnx", "local":
 		embedder, err := embedding.NewLocalONNX(embedding.LocalConfig{
 			ModelPath:         opts.embeddingModelPath,
@@ -226,16 +261,16 @@ func stage1Dependencies(ctx context.Context, opts options) (cache.Store, cascade
 			MaxSequenceLength: opts.embeddingMaxSequenceLen,
 		})
 		if err != nil {
-			store.Close()
+			closeStore()
 			return nil, nil, func() {}, err
 		}
 		closeAll := func() {
 			_ = embedder.Close()
-			store.Close()
+			closeStore()
 		}
 		return store, embedder, closeAll, nil
 	default:
-		store.Close()
+		closeStore()
 		return nil, nil, func() {}, fmt.Errorf("unsupported embedding backend %q", opts.embeddingBackend)
 	}
 }
